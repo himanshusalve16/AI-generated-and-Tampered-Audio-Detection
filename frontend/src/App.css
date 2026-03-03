@@ -1,0 +1,154 @@
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2rem 1rem;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #f5f5f7;
+  color: #111827;
+}
+
+.app-header {
+  text-align: center;
+  margin-bottom: 1.5rem;
+  max-width: 720px;
+}
+
+.app-header h1 {
+  font-size: 1.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.subtitle {
+  font-size: 0.95rem;
+  color: #4b5563;
+}
+
+.card {
+  width: 100%;
+  max-width: 720px;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+  padding: 1.5rem;
+  display: grid;
+  gap: 1.5rem;
+}
+
+@media (min-width: 768px) {
+  .card {
+    grid-template-columns: 1.1fr 0.9fr;
+  }
+}
+
+.upload-section,
+.result-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.file-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  border: 1px dashed #d1d5db;
+  background-color: #f9fafb;
+  font-size: 0.9rem;
+}
+
+.file-label input[type='file'] {
+  font-size: 0.85rem;
+}
+
+.audio-preview {
+  margin-top: 0.5rem;
+}
+
+.section-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 0.25rem;
+}
+
+audio {
+  width: 100%;
+}
+
+.file-name {
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.upload-button {
+  margin-top: 0.75rem;
+  padding: 0.6rem 1rem;
+  border-radius: 999px;
+  border: none;
+  background: #2563eb;
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.05s ease, box-shadow 0.15s ease;
+  box-shadow: 0 10px 20px rgba(37, 99, 235, 0.25);
+}
+
+.upload-button:hover:not(:disabled) {
+  background: #1d4ed8;
+  transform: translateY(-1px);
+}
+
+.upload-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.loading {
+  font-size: 0.85rem;
+  color: #6b7280;
+}
+
+.error {
+  font-size: 0.85rem;
+  color: #b91c1c;
+}
+
+.result-section h2 {
+  font-size: 1.1rem;
+  margin-bottom: 0.25rem;
+}
+
+.result {
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+}
+
+.prediction,
+.confidence {
+  font-size: 0.95rem;
+  margin-bottom: 0.25rem;
+}
+
+.prediction-label {
+  font-weight: 700;
+}
+
+.placeholder {
+  font-size: 0.85rem;
+  color: #6b7280;
+}
+
+.footer {
+  margin-top: 1.5rem;
+  font-size: 0.8rem;
+  color: #6b7280;
+  text-align: center;
+}

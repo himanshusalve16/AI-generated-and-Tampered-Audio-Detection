@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environment (Windows)
+Scripts/
+
+# Jupyter / misc
+.ipynb_checkpoints/
+
+# PyTorch / models
+models/*.pth
+
+# Datasets (optional - usually large and regenerated)
+dataset/
+
+# FastAPI / Uvicorn
+*.log
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment & secrets
+.env
+.env.*
