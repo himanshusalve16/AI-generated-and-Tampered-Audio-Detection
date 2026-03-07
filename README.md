@@ -40,7 +40,7 @@ It combines:
 
 ```text
 DL Project/
-  frontend/          # React (Vite) SPA UI
+  frontend/          # React (Vite) SPA UI (do not modify)
     src/
       main.jsx
       App.jsx
@@ -55,27 +55,28 @@ DL Project/
     index.html
 
   backend/           # FastAPI API + inference
-    main.py          # API, CORS, endpoints, startup model load
-    preprocess.py    # Audio preprocessing -> (1, 224, 224) tensor
-    model_loader.py  # ResNet-18 model + predict()
+    main.py          # App, CORS, /health, /predict, lifespan, logging, validation
+    preprocess.py    # Audio → mel spectrogram → (1, 224, 224) tensor
+    model_loader.py  # ResNet-18 load + predict() with softmax
+    utils.py         # Logging, file validation, constants, paths
     requirements.txt
 
   training/          # Training-only code (no API)
-    dataset.py       # AudioDataset (dataset/real, dataset/fake)
+    dataset.py       # AudioDataset (real/fake), same preprocessing as backend
     model.py         # AudioResNet (ResNet-18, 1-channel, 2 classes)
-    train.py         # Training loop, validation, saves best model
+    train.py         # Train/val loops, metrics, CLI, best model save
 
   dataset/           # (You create this)
     real/            # Real speech audio clips
     fake/            # AI-generated / tampered clips
 
   models/
-    audio_model.pth  # (Created after training; used by backend)
+    audio_model.pth  # (Created after training; used by backend at startup)
 ```
 
-- **frontend/** – UI only  
-- **backend/** – API + inference only  
-- **training/** – training pipeline only  
+- **frontend/** – UI only (upload, preview, call `/predict`, display result)  
+- **backend/** – API + inference only (modular, with logging and validation)  
+- **training/** – training pipeline only (dataset, model, train script with CLI)  
 - **models/** – saved weights only  
 
 ---
@@ -113,16 +114,16 @@ DL Project/
 - **Request**:
   - `Content-Type: multipart/form-data`
   - Field: `file` (audio file)
-- **Response (expected)**:
+- **Response (backend returns)**:
 
 ```json
 {
-  "prediction": "Real",
+  "label": "Real",
   "confidence": 0.93
 }
 ```
 
-The frontend uses this response to render the label and confidence.
+The frontend reads `label` and `confidence` from the response to display the prediction and confidence score.
 
 ### 3.4 Running the Frontend
 
@@ -142,11 +143,13 @@ Open the URL printed by Vite (typically `http://localhost:5173`).
 
 ### 4.1 Tech Stack
 
-- **FastAPI** – web framework for Python
+- **FastAPI** – web framework with request validation and error handling
 - **Uvicorn** – ASGI server
-- **Librosa** – audio loading and feature extraction
-- **NumPy**
-- **PyTorch** + **Torchvision** – model and tensors
+- **Librosa** – audio loading and mel-spectrogram extraction
+- **NumPy** – array operations
+- **PyTorch** + **Torchvision** – ResNet-18 and tensors
+
+The backend uses a **modular architecture**: `utils.py` provides structured logging, file validation (size, extension, content type), and path constants; `main.py` wires endpoints and lifecycle; `preprocess.py` and `model_loader.py` handle audio and inference.
 
 ### 4.2 Installing Backend Dependencies
 
@@ -169,10 +172,10 @@ API base URL: `http://localhost:8000`
 
 ### 4.4 CORS Configuration
 
-`main.py` configures CORS to allow the React frontend:
+`main.py` configures CORS so the React frontend can call the API:
 
-- **Allowed origin**: `http://localhost:5173`
-- **Methods**: all
+- **Allowed origins**: `http://localhost:5173` (from `utils.CORS_ORIGINS`)
+- **Methods**: GET, POST, OPTIONS
 - **Headers**: all
 
 ---
@@ -181,7 +184,7 @@ API base URL: `http://localhost:8000`
 
 ### 5.1 `GET /health`
 
-- Simple health check.
+- Health check for monitoring and load balancers.
 - Response:
 
 ```json
@@ -190,71 +193,55 @@ API base URL: `http://localhost:8000`
 
 ### 5.2 `POST /predict`
 
-- Accepts an uploaded file:
-  - Parameter name: `file`
-  - Type: `UploadFile`
-  - Expected content: `.wav` / `.mp3` (`audio/*` content type)
-- Processing steps:
-  1. Validate file presence and type.
-  2. Call `preprocess_audio(file.file)` → tensor of shape `(1, 224, 224)`.
-  3. Call `model_loader.predict(tensor)` → `(label, confidence)`.
-  4. Return JSON:
+- **Parameter**: `file` (UploadFile) – audio file (e.g. WAV, MP3, FLAC).
+- **Request validation** (in `utils.validate_audio_upload`):
+  - Non-empty filename and file size > 0.
+  - Max size: 50 MB.
+  - Allowed extensions: `.wav`, `.mp3`, `.flac`, `.ogg`, `.m4a`, `.webm`.
+  - Allowed content types: common `audio/*` and `application/octet-stream`.
+- **Processing steps**:
+  1. Validate uploaded file (size, type, extension).
+  2. Load audio and preprocess via `preprocess_audio()` → tensor `(1, 224, 224)`.
+  3. Run `model_loader.predict(tensor)` → `(label, confidence)`.
+  4. Return JSON (frontend expects `label` and `confidence`):
 
 ```json
 {
-  "prediction": "Real",
+  "label": "Real",
   "confidence": 0.85
 }
 ```
 
-- If model weights are missing (`models/audio_model.pth` not found), the backend returns a **mock-like** response:
-  - `prediction`: `"Real"`
-  - `confidence`: `0.85`
-
-Errors during preprocessing or inference are wrapped as `HTTPException` with clear messages.
+- **If the model is not loaded** (e.g. `models/audio_model.pth` missing): the server still starts, but `/predict` returns **503** with a message to train and place the model, then restart.
+- **Error handling**: validation errors (400), processing/inference errors (422), model-not-loaded (503), and unexpected errors (500). All errors include a `detail` message; structured logging records failures.
 
 ---
 
 ## 6. Audio Preprocessing (`backend/preprocess.py`)
 
-### 6.1 Function: `preprocess_audio(file)`
+Preprocessing is **modular**: each step is a small function so the pipeline is easy to follow and keep in sync with the training dataset.
 
-Signature:
+### 6.1 Constants (must match `training/dataset.py`)
 
-```python
-def preprocess_audio(file) -> torch.Tensor:
-    # returns tensor of shape (1, 224, 224)
-```
+- `TARGET_SR = 16000`, `TARGET_DURATION_SEC = 3.0`, `TARGET_NUM_SAMPLES = 48000`
+- `TARGET_SIZE = 224` (output height and width)
+- `N_FFT = 1024`, `HOP_LENGTH = 512`, `N_MELS = 128`, `POWER = 2.0`, `TRIM_TOP_DB = 20`
 
-**Steps:**
+### 6.2 Function: `preprocess_audio(file)`
 
-1. **Load & resample**
-   - Read raw bytes from `file`.
-   - Wrap in `io.BytesIO` and call `librosa.load(buffer, sr=16000, mono=True)` to:
-     - Decode audio
-     - Convert to mono
-     - Resample to **16 kHz**
-2. **Trim silence**
-   - `librosa.effects.trim(y, top_db=20)` removes leading and trailing silence.
-3. **Pad / cut to 3 seconds**
-   - Target duration: 3 seconds at 16 kHz → 48,000 samples.
-   - If shorter: zero-pad at the end.
-   - If longer: take a centered 3-second window.
-4. **Mel-spectrogram**
-   - Use `librosa.feature.melspectrogram` with:
-     - `n_fft=1024`, `hop_length=512`, `n_mels=128`, `power=2.0`.
-5. **Log scale**
-   - Convert to decibel scale with `librosa.power_to_db(mel, ref=np.max)`.
-6. **Normalize**
-   - Standardize per spectrogram: subtract mean and divide by standard deviation.
-7. **Resize to 224×224**
-   - Convert to torch tensor `(1, n_mels, time)`.
-   - Add batch dimension → `(1, 1, n_mels, time)`.
-   - Use `torch.nn.functional.interpolate` (bilinear) to `(1, 1, 224, 224)`.
-8. **Return**
-   - Remove batch dimension → final tensor shape `(1, 224, 224)`.
+- **Input**: `file` can be a binary file-like object, raw `bytes`, or a `str` path to an audio file.
+- **Output**: `torch.Tensor` of shape `(1, 224, 224)`, float32, CPU.
 
-This is the exact input shape expected by the ResNet‑18 model.
+**Steps (implemented as helpers):**
+
+1. **Load & resample** – `librosa.load(..., sr=TARGET_SR, mono=True)` (16 kHz, mono).
+2. **Trim silence** – `_trim_silence(y)` using `librosa.effects.trim(y, top_db=TRIM_TOP_DB)`.
+3. **Pad / crop** – `_pad_or_crop_to_fixed_length(y, TARGET_NUM_SAMPLES)` (3 seconds).
+4. **Mel spectrogram** – `_compute_mel_spectrogram(y)` with the constants above.
+5. **Log scale** – `_to_log_scale(mel_spec)` → `librosa.power_to_db(..., ref=np.max)`.
+6. **Normalize** – `_normalize_spectrogram(mel_db)` (zero mean, unit variance per spectrogram).
+7. **To tensor and resize** – `_resize_to_target(..., 224, 224)` with `F.interpolate` (bilinear).
+8. **Return** – tensor shape `(1, 224, 224)` for the ResNet-18 input.
 
 ---
 
@@ -293,17 +280,17 @@ models/audio_model.pth
 ### 7.4 Prediction Function
 
 ```python
-def predict(tensor):
+def predict(tensor: torch.Tensor) -> Tuple[str, float]:
     # tensor shape: (1, 224, 224)
-    # 1. Add batch dimension -> (1, 1, 224, 224)
-    # 2. Forward pass
-    # 3. Apply softmax
-    # 4. Return label ("Real"/"AI-Generated") and confidence in [0, 1]
+    # 1. Add batch dimension -> (1, 1, 224, 224), move to device
+    # 2. Forward pass (logits)
+    # 3. Softmax -> probabilities
+    # 4. Argmax for class index, max prob for confidence
+    # 5. Map index to CLASS_LABELS: 0 -> "Real", 1 -> "AI Generated"
 ```
 
-- Output:
-  - **Label**: `"Real"` if class index 0, else `"AI-Generated"`.
-  - **Confidence**: maximum softmax probability (float).
+- **Returns**: `(label, confidence)` where `label` is `"Real"` or `"AI Generated"` and `confidence` is in [0, 1].
+- **Raises**: `RuntimeError` if the model was not loaded; `ValueError` if the tensor shape is not `(1, 224, 224)`.
 
 ---
 
@@ -317,23 +304,17 @@ Expected folder structure:
 
 ```text
 dataset/
-  real/   # label 0
-  fake/   # label 1
+  real/   # label 0 (Real)
+  fake/   # label 1 (AI Generated / Fake)
 ```
 
 **AudioDataset**:
 
-- Scans `real/` and `fake/` for files.
-- For each file:
-  - Assigns label `0` (real) or `1` (fake/AI).
-  - Applies the **same preprocessing** as `preprocess_audio`:
-    - Load with librosa (sr=16000, mono)
-    - Trim silence
-    - Pad/cut to 3 seconds
-    - Mel-spectrogram → log → normalize → resize to 224×224
-- `__getitem__` returns:
-  - Tensor of shape `(1, 224, 224)`
-  - Integer label (0 or 1)
+- Constructor: `root_dir`, optional `real_subdir`/`fake_subdir`, and optional `extensions` filter.
+- Scans both subdirs and builds a list of `(path, label)`.
+- **Preprocessing** is identical to `backend/preprocess.py`: same constants and step-by-step helpers (`_trim_silence`, `_pad_or_crop_to_fixed_length`, mel spectrogram, log scale, normalize, resize). The shared helper is `waveform_to_tensor(y)`.
+- `__getitem__(idx)` loads the file with librosa (sr=16000, mono), then `waveform_to_tensor(y)` → tensor `(1, 224, 224)` and integer label 0 or 1.
+- Raises `FileNotFoundError` if `real/` or `fake/` is missing, and `ValueError` if no files are found.
 
 ### 8.2 Model (`training/model.py`)
 
@@ -345,47 +326,46 @@ dataset/
 
 ### 8.3 Training Script (`training/train.py`)
 
-Default configuration:
+**Default configuration:**
 
-- `dataset_root = "../dataset"`
-- `models_dir = "../models"`
-- `batch_size = 8`
-- `num_epochs = 10`
+- `dataset_root` = project root `dataset/`
+- `models_dir` = project root `models/`
+- `batch_size = 16`
+- `num_epochs = 25`
 - `learning_rate = 1e-4`
 - `val_split = 0.2`
+- `num_workers = 0`
+- Random seed: `42` (for reproducibility)
 
-Training steps:
+**CLI options:**
 
-1. Select device (`cuda` if available).
-2. Instantiate `AudioDataset`.
-3. Split dataset into train/validation using `random_split`.
-4. Create `DataLoader`s for train and validation.
-5. Instantiate `AudioResNet`, `Adam` optimizer, `CrossEntropyLoss`.
-6. For each epoch:
-   - **Train loop**:
-     - Forward pass, compute loss, backward, optimizer step.
-     - Track training loss and accuracy.
-   - **Validation loop**:
-     - Evaluate on validation set.
-     - Track validation loss and accuracy.
-   - Print a concise summary per epoch:
-
-```text
-Epoch 01/10 - Train Loss: 0.6931 | Train Acc: 0.500 - Val Loss: 0.6900 | Val Acc: 0.550
+```bash
+python train.py [--dataset PATH] [--models-dir PATH] [--batch-size N] [--epochs N] [--lr FLOAT] [--val-split FLOAT] [--num-workers N] [--verbose]
 ```
 
-7. If validation accuracy improves:
-   - Save `model.state_dict()` to `../models/audio_model.pth`.
-   - Print a message indicating a new best model has been saved.
+**Training steps:**
 
-Run training from the `training/` directory:
+1. Set up logging and random seed (numpy, torch, CUDA if available).
+2. Load `AudioDataset`, split with `random_split` into train/validation.
+3. Create `DataLoader`s (train shuffled, val not).
+4. Instantiate `AudioResNet`, `Adam`, `CrossEntropyLoss`.
+5. For each epoch:
+   - **Train**: `run_epoch_train()` – forward, loss, backward, step; aggregate loss and accuracy.
+   - **Validation**: `run_epoch_val()` – no grad, aggregate loss and accuracy.
+   - Log: `Epoch xxx/xxx | Train Loss: ... | Train Acc: ... | Val Loss: ... | Val Acc: ...`
+   - If validation accuracy improves: save `model.state_dict()` to `models/audio_model.pth` and log that the best model was saved.
+6. Final log: best validation accuracy and path to saved model.
+
+**Run training** (from project root or `training/`):
 
 ```bash
 cd training
 python train.py
+# Or with options:
+python train.py --epochs 30 --batch-size 32 --lr 5e-5
 ```
 
-After successful training, the backend will automatically pick up `models/audio_model.pth` for inference.
+After training, place or keep `audio_model.pth` in `models/` and (re)start the backend so it loads the new weights at startup.
 
 ---
 
@@ -455,12 +435,12 @@ Open `http://localhost:5173` in your browser.
 
 ```json
 {
-  "prediction": "Real",
+  "label": "Real",
   "confidence": 0.85
 }
 ```
 
-- The frontend shows the label and confidence with smooth animations.
+- The frontend displays the label and confidence with smooth animations.
 
 ---
 

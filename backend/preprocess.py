@@ -1,91 +1,173 @@
-from __future__ import annotations
+"""
+Audio preprocessing module for the Audio Deepfake Detection pipeline.
+
+Converts raw audio (file or bytes) into a normalized mel-spectrogram tensor
+of shape (1, 224, 224) suitable for the ResNet-18 model. Preprocessing steps
+are identical to the training pipeline so that inference and training see
+the same feature distribution.
+
+Steps performed:
+  1. Load audio using librosa (supports WAV, MP3, FLAC, etc.)
+  2. Resample to 16000 Hz (single standard for all inputs)
+  3. Trim leading and trailing silence
+  4. Pad or crop to exactly 3 seconds
+  5. Compute mel spectrogram
+  6. Convert to log scale (decibels)
+  7. Normalize (zero mean, unit variance per spectrogram)
+  8. Resize to 224x224 (spatial size expected by ResNet-18)
+  9. Convert to PyTorch tensor
+"""
 
 import io
-from typing import BinaryIO
+from typing import BinaryIO, Union
 
 import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+# -----------------------------------------------------------------------------
+# Preprocessing constants (must match training/dataset.py)
+# -----------------------------------------------------------------------------
 
-TARGET_SR = 16_000
-TARGET_DURATION_SECONDS = 3.0
-TARGET_NUM_SAMPLES = int(TARGET_SR * TARGET_DURATION_SECONDS)
+# Target sample rate in Hz. 16 kHz is common for speech and keeps computation manageable.
+TARGET_SR = 16000
+
+# Fixed duration in seconds. All clips are normalized to this length.
+TARGET_DURATION_SEC = 3.0
+
+# Number of samples corresponding to TARGET_DURATION_SEC at TARGET_SR.
+TARGET_NUM_SAMPLES = int(TARGET_SR * TARGET_DURATION_SEC)
+
+# Output spatial size (height and width) for the spectrogram image. ResNet-18 typically expects 224x224.
 TARGET_SIZE = 224
 
+# Mel spectrogram parameters (same as in training for consistency)
+N_FFT = 1024
+HOP_LENGTH = 512
+N_MELS = 128
+POWER = 2.0
 
-def preprocess_audio(file: BinaryIO) -> torch.Tensor:
-  """
-  Preprocess an uploaded audio file into a normalized mel-spectrogram tensor.
+# Silence trimming: frames with amplitude below this dB relative to max are trimmed.
+TRIM_TOP_DB = 20
 
-  Steps:
-  1. Load audio using librosa from a binary file-like object.
-  2. Resample to 16 kHz.
-  3. Trim leading and trailing silence.
-  4. Pad or cut the signal to exactly 3 seconds.
-  5. Compute mel-spectrogram.
-  6. Convert to log scale (dB).
-  7. Normalize values (per-spectrogram standardization).
-  8. Resize to 224x224 using bilinear interpolation.
-  9. Return a PyTorch tensor of shape (1, 224, 224).
-  """
 
-  # Read the entire file into memory and create a buffer so librosa can load it.
-  raw_bytes = file.read()
-  audio_buffer = io.BytesIO(raw_bytes)
+# -----------------------------------------------------------------------------
+# Core preprocessing: waveform -> tensor
+# -----------------------------------------------------------------------------
 
-  # 1 & 2. Load and resample audio to TARGET_SR in one step.
-  # librosa will convert the audio to mono by default (mono=True).
-  y, sr = librosa.load(audio_buffer, sr=TARGET_SR, mono=True)
+def _trim_silence(y: np.ndarray) -> np.ndarray:
+    """Trim leading and trailing silence from the waveform."""
+    y_trimmed, _ = librosa.effects.trim(y, top_db=TRIM_TOP_DB)
+    return y_trimmed
 
-  # 3. Trim leading and trailing silence to reduce irrelevant padding.
-  y, _ = librosa.effects.trim(y, top_db=20)
 
-  # 4. Pad or cut the waveform to a fixed length (3 seconds at 16 kHz).
-  if len(y) < TARGET_NUM_SAMPLES:
-    # Pad with zeros at the end if the clip is too short.
-    pad_width = TARGET_NUM_SAMPLES - len(y)
-    y = np.pad(y, (0, pad_width), mode="constant")
-  elif len(y) > TARGET_NUM_SAMPLES:
-    # If the clip is too long, take a centered 3-second segment.
-    start = (len(y) - TARGET_NUM_SAMPLES) // 2
-    y = y[start : start + TARGET_NUM_SAMPLES]
+def _pad_or_crop_to_fixed_length(y: np.ndarray, target_length: int) -> np.ndarray:
+    """
+    Ensure the waveform has exactly target_length samples.
+    If shorter: zero-pad at the end. If longer: take a centered segment.
+    """
+    n = len(y)
+    if n < target_length:
+        pad_len = target_length - n
+        y = np.pad(y, (0, pad_len), mode="constant", constant_values=0.0)
+    elif n > target_length:
+        start = (n - target_length) // 2
+        y = y[start : start + target_length]
+    return y
 
-  # 5. Compute mel-spectrogram.
-  mel_spec = librosa.feature.melspectrogram(
-    y=y,
-    sr=TARGET_SR,
-    n_fft=1024,
-    hop_length=512,
-    n_mels=128,
-    power=2.0,
-  )
 
-  # 6. Convert power spectrogram to decibel (log) scale.
-  mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+def _compute_mel_spectrogram(y: np.ndarray) -> np.ndarray:
+    """Compute mel spectrogram from waveform (power scale)."""
+    mel_spec = librosa.feature.melspectrogram(
+        y=y,
+        sr=TARGET_SR,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        n_mels=N_MELS,
+        power=POWER,
+    )
+    return mel_spec
 
-  # 7. Normalize the spectrogram (per-sample mean/std) for more stable training/inference.
-  mean = mel_spec_db.mean()
-  std = mel_spec_db.std() if mel_spec_db.std() > 0 else 1.0
-  mel_spec_norm = (mel_spec_db - mean) / std
 
-  # 8. Convert to a PyTorch tensor and resize to (1, 224, 224).
-  # Current shape is (n_mels, time_steps). We treat this as a single-channel image.
-  tensor = torch.from_numpy(mel_spec_norm).float().unsqueeze(0)  # (1, n_mels, time)
+def _to_log_scale(mel_spec: np.ndarray) -> np.ndarray:
+    """Convert power spectrogram to log scale (decibels)."""
+    return librosa.power_to_db(mel_spec, ref=np.max)
 
-  # Use bilinear interpolation to resize the "image" to 224x224.
-  # Interpolate expects a 4D tensor: (batch, channels, height, width).
-  tensor = tensor.unsqueeze(0)  # (1, 1, n_mels, time)
-  tensor_resized = F.interpolate(
-    tensor,
-    size=(TARGET_SIZE, TARGET_SIZE),
-    mode="bilinear",
-    align_corners=False,
-  )
 
-  # 9. Remove the batch dimension; final shape is (1, 224, 224).
-  tensor_resized = tensor_resized.squeeze(0)
+def _normalize_spectrogram(mel_db: np.ndarray) -> np.ndarray:
+    """Normalize to zero mean and unit variance (per spectrogram)."""
+    mean = float(np.mean(mel_db))
+    std = float(np.std(mel_db))
+    if std <= 0:
+        std = 1.0
+    return (mel_db - mean) / std
 
-  return tensor_resized
 
+def _resize_to_target(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """
+    Resize a single-channel tensor (1, H, W) to (1, target_h, target_w)
+    using bilinear interpolation.
+    """
+    # F.interpolate expects (N, C, H, W)
+    tensor_4d = tensor.unsqueeze(0)
+    resized = F.interpolate(
+        tensor_4d,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.squeeze(0)
+
+
+def _waveform_to_tensor(y: np.ndarray) -> torch.Tensor:
+    """
+    Convert a mono waveform (already at TARGET_SR) to a tensor of shape (1, 224, 224).
+
+    This function is the core of preprocessing and is shared conceptually with
+    the training dataset so that train and inference use identical transforms.
+    """
+    y = _trim_silence(y)
+    y = _pad_or_crop_to_fixed_length(y, TARGET_NUM_SAMPLES)
+
+    mel_spec = _compute_mel_spectrogram(y)
+    mel_db = _to_log_scale(mel_spec)
+    mel_norm = _normalize_spectrogram(mel_db)
+
+    # To tensor: (n_mels, time) -> (1, n_mels, time)
+    tensor = torch.from_numpy(mel_norm).float().unsqueeze(0)
+    tensor = _resize_to_target(tensor, TARGET_SIZE, TARGET_SIZE)
+    return tensor  # (1, 224, 224)
+
+
+# -----------------------------------------------------------------------------
+# Public API: accept file-like, bytes, or file path
+# -----------------------------------------------------------------------------
+
+def preprocess_audio(file: Union[BinaryIO, bytes, str]) -> torch.Tensor:
+    """
+    Preprocess an audio source into a normalized mel-spectrogram tensor.
+
+    Args:
+        file: Either a binary file-like object (e.g. from FastAPI UploadFile.read()),
+              raw bytes of an audio file, or a path (str) to an audio file on disk.
+
+    Returns:
+        Tensor of shape (1, 224, 224), dtype float32, on CPU. No batch dimension;
+        the model loader will add the batch dimension for inference.
+
+    Raises:
+        ValueError: If the audio cannot be loaded or is invalid.
+    """
+    if isinstance(file, bytes):
+        file = io.BytesIO(file)
+    elif isinstance(file, str):
+        y, _ = librosa.load(file, sr=TARGET_SR, mono=True)
+        return _waveform_to_tensor(y)
+
+    # File-like object: read content then load
+    raw = file.read() if hasattr(file, "read") else file
+    if isinstance(raw, bytes):
+        file = io.BytesIO(raw)
+    y, _ = librosa.load(file, sr=TARGET_SR, mono=True)
+    return _waveform_to_tensor(y)
