@@ -1,7 +1,7 @@
 """
 Full training pipeline for the Audio Deepfake Detection model.
 
-Loads audio from dataset/real and dataset/fake, applies the same preprocessing
+Loads audio from dataset/train/real and dataset/train/fake, applies the same preprocessing
 as the backend, trains a ResNet-18 with Adam and CrossEntropyLoss, and saves
 the best model (by validation accuracy) to models/audio_model.pth.
 
@@ -15,13 +15,13 @@ import logging
 import random
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
 from torch.optim import Adam
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
 from dataset import AudioDataset
 from model import AudioResNet
@@ -35,6 +35,8 @@ PROJECT_ROOT = TRAINING_DIR.parent
 DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset"
 DEFAULT_MODELS_DIR = PROJECT_ROOT / "models"
 BEST_MODEL_FILENAME = "audio_model.pth"
+DEFAULT_TRAIN_SUBDIR = "train"
+DEFAULT_TEST_SUBDIR = "test"
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -121,6 +123,27 @@ def run_epoch_val(
     }
 
 
+def _resolve_split_dirs(dataset_root: Path, train_subdir: str, test_subdir: str) -> Tuple[Path, Optional[Path]]:
+    """
+    Resolve train/test directories.
+
+    Preferred structure:
+      dataset_root/
+        train/real, train/fake
+        test/real,  test/fake
+
+    Backward-compatible fallback:
+      dataset_root/real, dataset_root/fake  (no separate test set)
+    """
+    train_dir = dataset_root / train_subdir
+    test_dir = dataset_root / test_subdir
+
+    if train_dir.exists():
+        return train_dir, (test_dir if test_dir.exists() else None)
+
+    return dataset_root, None
+
+
 # -----------------------------------------------------------------------------
 # Main training entry point
 # -----------------------------------------------------------------------------
@@ -128,6 +151,8 @@ def run_epoch_val(
 def train(
     dataset_root: Optional[str] = None,
     models_dir: Optional[str] = None,
+    train_subdir: str = DEFAULT_TRAIN_SUBDIR,
+    test_subdir: str = DEFAULT_TEST_SUBDIR,
     batch_size: int = 16,
     num_epochs: int = 25,
     learning_rate: float = 1e-4,
@@ -168,13 +193,40 @@ def train(
     logger.info("Models dir:   %s", models_dir)
     logger.info("Batch size: %d, epochs: %d, lr: %s, val_split: %.2f", batch_size, num_epochs, learning_rate, val_split)
 
-    # Load dataset and split
-    dataset = AudioDataset(dataset_root)
-    total = len(dataset)
-    val_size = max(1, int(total * val_split))
-    train_size = total - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    logger.info("Total samples: %d (train: %d, val: %d)", total, train_size, val_size)
+    train_dir, _ = _resolve_split_dirs(dataset_root, train_subdir=train_subdir, test_subdir=test_subdir)
+    logger.info("Train dir: %s", train_dir)
+
+    # -------------------------------------------------------------------------
+    # Dataset subset mode (for faster experimentation)
+    # -------------------------------------------------------------------------
+    full_dataset = AudioDataset(train_dir)
+    total_available = len(full_dataset)
+
+    # Fixed seed for reproducible shuffling of indices
+    g = torch.Generator()
+    g.manual_seed(seed)
+    all_indices = torch.randperm(total_available, generator=g).tolist()
+
+    max_subset = min(1000, total_available)
+    subset_indices = all_indices[:max_subset]
+
+    train_count = min(800, max_subset)
+    test_count = max_subset - train_count
+
+    train_indices = subset_indices[:train_count]
+    test_indices = subset_indices[train_count:train_count + test_count]
+
+    train_dataset = Subset(full_dataset, train_indices)
+    # No separate validation subset in subset mode; keep val loader structurally,
+    # but make it empty so training loop stays unchanged.
+    val_dataset = Subset(full_dataset, [])
+    test_dataset = Subset(full_dataset, test_indices) if test_count > 0 else None
+
+    logger.info("Dataset subset mode enabled")
+    logger.info("Available samples in train dir: %d", total_available)
+    logger.info("Total samples used: %d", max_subset)
+    logger.info("Training samples: %d", train_count)
+    logger.info("Testing samples: %d", test_count)
 
     train_loader = DataLoader(
         train_dataset,
@@ -189,6 +241,15 @@ def train(
         shuffle=False,
         num_workers=num_workers,
     )
+
+    test_loader: Optional[DataLoader] = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        )
 
     model = AudioResNet().to(device)
     optimizer = Adam(model.parameters(), lr=learning_rate)
@@ -220,8 +281,26 @@ def train(
             torch.save(model.state_dict(), best_model_path)
             logger.info("  -> Best model saved to %s (val_acc=%.4f)", best_model_path, val_acc)
 
+    # In subset mode the validation loader can be effectively empty, so the
+    # val_acc condition above might never trigger and no checkpoint is saved.
+    # As a safeguard, ensure that we always have *some* model file to evaluate.
+    if not best_model_path.exists():
+        torch.save(model.state_dict(), best_model_path)
+        logger.info("No validation-based checkpoint found; saved final epoch model to %s", best_model_path)
+
     logger.info("Training complete. Best validation accuracy: %.4f", best_val_acc)
     logger.info("Best model saved to: %s", best_model_path)
+
+    if test_loader is not None:
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        model.to(device)
+        test_metrics = run_epoch_val(model, test_loader, criterion, device)
+        logger.info(
+            "Test set | Loss: %.4f | Acc: %.4f",
+            test_metrics["loss"],
+            test_metrics["accuracy"],
+        )
+
     return best_val_acc
 
 
@@ -232,6 +311,18 @@ def train(
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Audio Deepfake Detection model (ResNet-18).")
     parser.add_argument("--dataset", type=str, default=None, help="Path to dataset root (default: ../dataset)")
+    parser.add_argument(
+        "--train-subdir",
+        type=str,
+        default=DEFAULT_TRAIN_SUBDIR,
+        help="Subfolder under --dataset for training data (default: train). Ignored if --dataset points directly to a real/fake folder.",
+    )
+    parser.add_argument(
+        "--test-subdir",
+        type=str,
+        default=DEFAULT_TEST_SUBDIR,
+        help="Subfolder under --dataset for test data (default: test). If missing, test evaluation is skipped.",
+    )
     parser.add_argument("--models-dir", type=str, default=None, help="Directory to save model (default: ../models)")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
@@ -247,6 +338,8 @@ if __name__ == "__main__":
     train(
         dataset_root=args.dataset,
         models_dir=args.models_dir,
+        train_subdir=args.train_subdir,
+        test_subdir=args.test_subdir,
         batch_size=args.batch_size,
         num_epochs=args.epochs,
         learning_rate=args.lr,

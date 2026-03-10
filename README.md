@@ -67,8 +67,12 @@ DL Project/
     train.py         # Train/val loops, metrics, CLI, best model save
 
   dataset/           # (You create this)
-    real/            # Real speech audio clips
-    fake/            # AI-generated / tampered clips
+    train/
+      real/          # Real speech audio clips (training split)
+      fake/          # AI-generated / tampered clips (training split)
+    test/
+      real/          # Real speech audio clips (test split)
+      fake/          # AI-generated / tampered clips (test split)
 
   models/
     audio_model.pth  # (Created after training; used by backend at startup)
@@ -300,13 +304,24 @@ Training code is **separate** from the backend and not imported by the API.
 
 ### 8.1 Dataset (`training/dataset.py`)
 
-Expected folder structure:
+Expected folder structure (recommended):
 
 ```text
 dataset/
-  real/   # label 0 (Real)
-  fake/   # label 1 (AI Generated / Fake)
+  train/
+    real/   # label 0 (Real)
+    fake/   # label 1 (AI Generated / Fake)
+  test/
+    real/   # label 0 (Real)
+    fake/   # label 1 (AI Generated / Fake)
 ```
+
+Notes:
+
+- For **fast experiments on CPU**, the training script runs in **subset mode** (see section 8.4): it samples at most 1000 files from `dataset/train/*` automatically.
+- In subset mode, those 1000 files are split into **800 training** and **200 internal test** samples.
+- The original dataset on disk is never modified or deleted.
+- Backward-compatible: if you only have `dataset/real` and `dataset/fake`, training will still work (subset is taken from there).
 
 **AudioDataset**:
 
@@ -328,7 +343,7 @@ dataset/
 
 **Default configuration:**
 
-- `dataset_root` = project root `dataset/`
+- `dataset_root` = project root `dataset/` (expects `train/` + optional `test/` inside)
 - `models_dir` = project root `models/`
 - `batch_size = 16`
 - `num_epochs = 25`
@@ -340,36 +355,118 @@ dataset/
 **CLI options:**
 
 ```bash
-python train.py [--dataset PATH] [--models-dir PATH] [--batch-size N] [--epochs N] [--lr FLOAT] [--val-split FLOAT] [--num-workers N] [--verbose]
+python train.py [--dataset PATH] [--train-subdir train] [--test-subdir test] [--models-dir PATH] [--batch-size N] [--epochs N] [--lr FLOAT] [--val-split FLOAT] [--num-workers N] [--verbose]
 ```
 
 **Training steps:**
 
 1. Set up logging and random seed (numpy, torch, CUDA if available).
-2. Load `AudioDataset`, split with `random_split` into train/validation.
-3. Create `DataLoader`s (train shuffled, val not).
-4. Instantiate `AudioResNet`, `Adam`, `CrossEntropyLoss`.
-5. For each epoch:
-   - **Train**: `run_epoch_train()` – forward, loss, backward, step; aggregate loss and accuracy.
-   - **Validation**: `run_epoch_val()` – no grad, aggregate loss and accuracy.
+2. Load `AudioDataset` from `dataset/train` into memory as `full_dataset`.
+3. **Subset mode**: shuffle indices with a fixed seed (42), take at most 1000 samples, then:
+   - First 800 indices → **training subset**
+   - Remaining (up to 200) indices → **internal test subset**
+4. Wrap these subsets in `torch.utils.data.Subset` and build `DataLoader`s:
+   - `train_loader` over the 800 training samples (shuffled each epoch).
+   - `val_loader` is kept structurally but is effectively empty in subset mode (metrics are logged but not meaningful).
+   - `test_loader` over the 200 internal test samples (used after training completes).
+5. Instantiate `AudioResNet`, `Adam`, `CrossEntropyLoss`.
+6. For each epoch:
+   - **Train**: `run_epoch_train()` – forward, loss, backward, step; aggregate loss and accuracy on the 800-sample subset.
+   - **Validation**: `run_epoch_val()` – runs on the (empty) validation loader in subset mode (values default to zeros).
    - Log: `Epoch xxx/xxx | Train Loss: ... | Train Acc: ... | Val Loss: ... | Val Acc: ...`
    - If validation accuracy improves: save `model.state_dict()` to `models/audio_model.pth` and log that the best model was saved.
-6. Final log: best validation accuracy and path to saved model.
+7. After all epochs, log the best validation accuracy and path to the saved model.
+8. Reload the best checkpoint and evaluate once on the **200-sample internal test subset**, logging test loss/accuracy.
 
-**Run training** (from project root or `training/`):
+**Run training (subset mode)** – from project root or `training/`:
 
 ```bash
 cd training
 python train.py
-# Or with options:
-python train.py --epochs 30 --batch-size 32 --lr 5e-5
+# Or with options (subset size stays 1000 max):
+python train.py --epochs 10 --batch-size 8 --lr 5e-5
 ```
 
 After training, place or keep `audio_model.pth` in `models/` and (re)start the backend so it loads the new weights at startup.
 
+### 8.4 Subset Training Mode (Fast CPU Experiments)
+
+Because the full dataset is large (~22k+ samples), training on CPU can be very slow.  
+To make experimentation practical, `train.py` automatically enables a **subset training mode**:
+
+- **Where the data comes from**
+  - Uses `AudioDataset(train_dir)` where `train_dir` is typically `dataset/train`.
+  - Reads the full list of real/fake files but **does not modify or delete** any files.
+
+- **How the subset is chosen**
+  - A fixed seed `42` is used for all randomness (`random`, `numpy`, and `torch`).
+  - A `torch.Generator` with seed 42 generates a random permutation of all sample indices.
+  - At most **1000 indices** are kept:
+    - If your dataset has ≥ 1000 files → exactly 1000 are used.
+    - If it has < 1000 files → all are used.
+
+- **Train/test split inside the subset**
+  - First **800** indices → **training subset**.
+  - Remaining (up to **200**) indices → **internal test subset**.
+  - Those are wrapped in `Subset(full_dataset, indices)` and fed to `DataLoader`.
+
+- **Reproducibility**
+  - Because the seed is fixed at 42 and the same shuffling process is used each run,  
+    the **same 1000 files** (and same 800/200 split) are selected every time, as long as the underlying file list does not change.
+
+- **Logging**
+  - At startup, you will see logs like:
+
+    ```text
+    Dataset subset mode enabled
+    Available samples in train dir: 22245
+    Total samples used: 1000
+    Training samples: 800
+    Testing samples: 200
+    ```
+
+- **What the metrics mean**
+  - Epoch logs (`Train Loss`, `Train Acc`, `Val Loss`, `Val Acc`) are based on the **800-sample training subset**.
+  - Validation metrics in subset mode come from an effectively empty loader and are not meaningful.
+  - Final `Test set | Loss | Acc` logs are computed on the **200-sample internal test subset**.
+
 ---
 
 ## 9. End-to-End Setup Instructions
+
+## 9.1 Quickstart (Windows / PowerShell)
+
+From the project root (`d:\DL Project`):
+
+```bash
+# 1) Create & activate venv (recommended)
+python -m venv .venv
+.venv\Scripts\activate
+
+# 2) Install backend deps (includes training deps too)
+cd backend
+pip install -r requirements.txt
+cd ..
+
+# 3) Prepare dataset (required)
+# dataset/train/real, dataset/train/fake, dataset/test/real, dataset/test/fake
+
+# 4) Train with subset mode (saves models/audio_model.pth)
+cd training
+python train.py --epochs 10 --batch-size 8
+cd ..
+
+# 5) Run backend (loads models/audio_model.pth on startup)
+cd backend
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+# 6) In a new terminal: run frontend
+cd frontend
+npm install
+npm run dev
+```
+
+---
 
 1. **Clone / open the project folder** (already at `d:\DL Project`).
 2. **(Optional but recommended) Create a virtual environment**:
@@ -383,8 +480,10 @@ python -m venv .venv
 3. **Prepare dataset**:
 
 ```text
-d:\DL Project\dataset\real\   # real speech audio files
-d:\DL Project\dataset\fake\   # AI / tampered audio files
+d:\DL Project\dataset\train\real\   # real speech audio files (training split)
+d:\DL Project\dataset\train\fake\   # AI / tampered audio files (training split)
+d:\DL Project\dataset\test\real\    # real speech audio files (test split)
+d:\DL Project\dataset\test\fake\    # AI / tampered audio files (test split)
 ```
 
 4. **Install backend + training dependencies**:
@@ -399,6 +498,9 @@ pip install -r requirements.txt
 ```bash
 cd ../training
 python train.py
+# Optional flags:
+# python train.py --epochs 30 --batch-size 32 --lr 5e-5
+# python train.py --dataset "../dataset" --train-subdir train --test-subdir test
 ```
 
 Confirm that `../models/audio_model.pth` is created.

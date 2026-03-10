@@ -17,7 +17,6 @@ Scripts/
 .ipynb_checkpoints/
 
 # PyTorch / models
-models/*.pth
 
 # Datasets (optional - usually large and regenerated)
 dataset/

@@ -70,6 +70,10 @@ def load_model(path: str) -> nn.Module:
     Load the trained model weights from a .pth file and cache the model
     in memory for subsequent inference.
 
+    This function is robust to checkpoints where all keys in the state_dict
+    are prefixed with "model." (e.g., "model.conv1.weight"). It removes the
+    "model." prefix before loading into the ResNet instance.
+
     Args:
         path: Absolute or relative path to the state_dict file (e.g. audio_model.pth).
 
@@ -87,9 +91,26 @@ def load_model(path: str) -> nn.Module:
     if not path_obj.exists():
         raise FileNotFoundError(f"Model weights not found at {path}")
 
+    # Load checkpoint onto the chosen device (CPU or GPU)
+    checkpoint = torch.load(path_obj, map_location=DEVICE)
+
+    # Some checkpoints wrap the actual state_dict in a "state_dict" key
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    # Clean state_dict: strip leading "model." from keys if present
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("model."):
+            new_key = key[len("model.") :]
+        else:
+            new_key = key
+        cleaned_state_dict[new_key] = value
+
     model = _build_model()
-    state_dict = torch.load(path_obj, map_location=DEVICE)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(cleaned_state_dict)
     model.to(DEVICE)
     model.eval()
 
