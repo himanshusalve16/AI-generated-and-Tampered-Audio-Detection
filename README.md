@@ -1,5 +1,6 @@
 # AI-Generated and Tampered Audio Detection
 
+
 **Using Spectral Feature Analysis and Deep Learning**
 
 A full-stack web application that detects AI-generated or tampered audio using a **ResNet-18 + LSTM ensemble** trained on mel-spectrogram features. Upload a short speech clip, and the system will classify it as **Real** or **AI Generated** with confidence scores from two independent deep learning models.

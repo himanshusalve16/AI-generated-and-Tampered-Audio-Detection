@@ -1,6 +1,7 @@
 # LSTM — Bidirectional LSTM for Audio Deepfake Detection
 
 
+
 ## AudioLSTM class details (`training/model.py`)
 
 ```python

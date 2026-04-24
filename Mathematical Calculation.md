@@ -2,6 +2,7 @@
 
 This document contains all the detailed mathematical calculations for the project, including audio preprocessing, ResNet-18 operations, LSTM operations, pooling, classification, loss function, and ensemble logic.
 
+
 ## 1. Audio Preprocessing Mathematics
 
 ### 1.1 Audio Loading and Resampling

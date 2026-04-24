@@ -1,6 +1,5 @@
 # ResNet-18 (Audio Deepfake Detection)
 
-
 ## AudioResNet class details (`training/model.py`)
 
 ```python
