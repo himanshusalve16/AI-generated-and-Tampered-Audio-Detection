@@ -204,6 +204,7 @@ Open `http://localhost:5173` in your browser.
 | Input          | Mel spectrogram image `(1, 224, 224)`     |
 | Features       | 128 mel bands, 1024 FFT, 512 hop length   |
 | Preprocessing  | Log-dB, z-score normalization, bilinear resize |
+| Activations    | ReLU (in every residual block and after conv1) |
 | Output         | 2 logits → softmax → [P(Real), P(Fake)]  |
 
 ### LSTM (Temporal Sequence Classifier)
@@ -214,8 +215,35 @@ Open `http://localhost:5173` in your browser.
 | Input          | Mel-spectrogram time series `(94, 128)`   |
 | Features       | Same mel spectrogram (transposed, no resize) |
 | Hidden dim     | 128 per direction (256 total)             |
+| Gate activations | Sigmoid (input/forget/output gates), Tanh (cell state) |
+| Classifier activation | ReLU (in FC head between Linear layers) |
 | Dropout        | 0.3                                       |
 | Output         | 2 logits → softmax → [P(Real), P(Fake)]  |
+
+### Loss Function
+
+Both models are trained with **CrossEntropyLoss** (`torch.nn.CrossEntropyLoss`).
+
+CrossEntropyLoss combines `LogSoftmax` and `NLLLoss` in one step:
+
+```
+L = -log( exp(logits[y]) / Σ exp(logits[j]) )
+```
+
+Where `y` is the true class index (0 = Real, 1 = AI Generated). This is the standard loss for multi-class classification with raw logits.
+
+### Activation Functions Summary
+
+| Location | Activation | Purpose |
+|----------|-----------|---------|
+| ResNet BasicBlocks | **ReLU** | Non-linearity after each Conv+BN pair |
+| ResNet Conv1 | **ReLU** | Non-linearity after first convolution |
+| LSTM gates (internal) | **Sigmoid** | Controls information flow (input, forget, output gates) |
+| LSTM cell state (internal) | **Tanh** | Squashes cell state and candidate values to [-1, 1] |
+| LSTM classifier FC head | **ReLU** | Non-linearity between the two Linear layers |
+| Inference (both models) | **Softmax** | Converts raw logits to probabilities for prediction |
+
+> **Note:** Softmax is applied only at inference time (`model_loader.py`). During training, `CrossEntropyLoss` handles the softmax internally, so the models output raw logits.
 
 ### Ensemble Strategy
 
