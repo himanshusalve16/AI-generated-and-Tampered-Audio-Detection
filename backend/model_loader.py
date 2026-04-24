@@ -1,167 +1,251 @@
 """
-ResNet-18 model loader for audio deepfake detection.
+Dual-model loader and ensemble inference for audio deepfake detection.
 
-Provides a modified ResNet-18 CNN that accepts single-channel mel spectrograms
-(shape 1x224x224) and outputs two-class logits (Real vs AI Generated). Weights
-are loaded from disk once at server startup; inference is then performed in
-memory with optional GPU acceleration.
+Manages two models:
+  1. ResNet-18  — classifies mel-spectrogram images (1, 224, 224)
+  2. LSTM       — classifies temporal mel sequences  (1, T, N_MELS)
+
+At startup both .pth files are loaded into memory. The predict() function
+runs both models, applies softmax, and computes a weighted ensemble.
 
 Class index convention:
-  0 -> Real
-  1 -> AI Generated
+  0 → Real
+  1 → AI Generated
 """
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torchvision.models import resnet18
 
-# -----------------------------------------------------------------------------
-# Device and singleton model
-# -----------------------------------------------------------------------------
+from config import (
+    CLASS_LABELS,
+    LSTM_HIDDEN_DIM,
+    LSTM_INPUT_DIM,
+    LSTM_NUM_CLASSES,
+    LSTM_NUM_LAYERS,
+    LSTM_WEIGHT,
+    RESNET_NUM_CLASSES,
+    RESNET_WEIGHT,
+)
+
+# ---------------------------------------------------------------------------
+# Device
+# ---------------------------------------------------------------------------
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Single global model instance, set by load_model() at startup. Used by predict().
-_MODEL: nn.Module | None = None
+# ---------------------------------------------------------------------------
+# Singleton model instances
+# ---------------------------------------------------------------------------
 
-# Class labels for output (index 0 and 1)
-CLASS_LABELS = ("Real", "AI Generated")
+_RESNET_MODEL: Optional[nn.Module] = None
+_LSTM_MODEL: Optional[nn.Module] = None
 
 
-# -----------------------------------------------------------------------------
-# Model architecture: ResNet-18 for 1-channel input, 2 classes
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
 
-def _build_model() -> nn.Module:
-    """
-    Construct a ResNet-18 with architecture changes for our task:
+@dataclass
+class EnsemblePrediction:
+    """All prediction outputs needed by the API response."""
+    resnet_prediction: str
+    resnet_confidence: float
+    lstm_prediction: str
+    lstm_confidence: float
+    ensemble_prediction: str
+    ensemble_confidence: float
 
-    1. First convolution: accept 1 channel (mel spectrogram) instead of 3 (RGB).
-    2. Final fully connected layer: output 2 logits (Real, AI Generated) instead of 1000.
-    """
+
+# ---------------------------------------------------------------------------
+# Architecture builders
+# ---------------------------------------------------------------------------
+
+def _build_resnet() -> nn.Module:
+    """ResNet-18: 1-channel input, 2-class output."""
     model = resnet18(weights=None)
-
-    # Replace the first conv layer (in_channels=3 -> 1)
-    model.conv1 = nn.Conv2d(
-        in_channels=1,
-        out_channels=64,
-        kernel_size=7,
-        stride=2,
-        padding=3,
-        bias=False,
-    )
-
-    # Replace the classifier head
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, 2)
-
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    model.fc = nn.Linear(model.fc.in_features, RESNET_NUM_CLASSES)
     return model
 
 
-# -----------------------------------------------------------------------------
-# Load model from checkpoint (call once at startup)
-# -----------------------------------------------------------------------------
+class _AudioLSTM(nn.Module):
+    """Bidirectional LSTM matching training/model.py AudioLSTM."""
 
-def load_model(path: str) -> nn.Module:
-    """
-    Load the trained model weights from a .pth file and cache the model
-    in memory for subsequent inference.
+    def __init__(
+        self,
+        input_dim: int = LSTM_INPUT_DIM,
+        hidden_dim: int = LSTM_HIDDEN_DIM,
+        num_layers: int = LSTM_NUM_LAYERS,
+        num_classes: int = LSTM_NUM_CLASSES,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes),
+        )
 
-    This function is robust to checkpoints where all keys in the state_dict
-    are prefixed with "model." (e.g., "model.conv1.weight"). It removes the
-    "model." prefix before loading into the ResNet instance.
-
-    Args:
-        path: Absolute or relative path to the state_dict file (e.g. audio_model.pth).
-
-    Returns:
-        The loaded model in eval mode, on the appropriate device (CPU/GPU).
-
-    Raises:
-        FileNotFoundError: If the path does not exist.
-    """
-    global _MODEL
-    if _MODEL is not None:
-        return _MODEL
-
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(f"Model weights not found at {path}")
-
-    # Load checkpoint onto the chosen device (CPU or GPU)
-    checkpoint = torch.load(path_obj, map_location=DEVICE)
-
-    # Some checkpoints wrap the actual state_dict in a "state_dict" key
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    # Clean state_dict: strip leading "model." from keys if present
-    cleaned_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith("model."):
-            new_key = key[len("model.") :]
-        else:
-            new_key = key
-        cleaned_state_dict[new_key] = value
-
-    model = _build_model()
-    model.load_state_dict(cleaned_state_dict)
-    model.to(DEVICE)
-    model.eval()
-
-    _MODEL = model
-    return _MODEL
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lstm_out, _ = self.lstm(x)
+        last = lstm_out[:, -1, :]
+        return self.classifier(last)
 
 
-# -----------------------------------------------------------------------------
-# Inference: tensor -> label and confidence
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# State-dict cleaning (handles "model." prefix from training wrapper)
+# ---------------------------------------------------------------------------
+
+def _clean_state_dict(raw: dict) -> dict:
+    """Strip optional 'model.' prefix from keys."""
+    if isinstance(raw, dict) and "state_dict" in raw:
+        raw = raw["state_dict"]
+    cleaned = {}
+    for k, v in raw.items():
+        cleaned[k[len("model."):] if k.startswith("model.") else k] = v
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Load helpers (called once at startup)
+# ---------------------------------------------------------------------------
+
+def load_resnet(path: str) -> nn.Module:
+    """Load and cache the ResNet model from a .pth checkpoint."""
+    global _RESNET_MODEL
+    if _RESNET_MODEL is not None:
+        return _RESNET_MODEL
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"ResNet weights not found at {path}")
+
+    checkpoint = torch.load(p, map_location=DEVICE)
+    state_dict = _clean_state_dict(checkpoint)
+
+    model = _build_resnet()
+    model.load_state_dict(state_dict)
+    model.to(DEVICE).eval()
+    _RESNET_MODEL = model
+    return _RESNET_MODEL
+
+
+def load_lstm(path: str) -> nn.Module:
+    """Load and cache the LSTM model from a .pth checkpoint."""
+    global _LSTM_MODEL
+    if _LSTM_MODEL is not None:
+        return _LSTM_MODEL
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"LSTM weights not found at {path}")
+
+    checkpoint = torch.load(p, map_location=DEVICE)
+    state_dict = _clean_state_dict(checkpoint)
+
+    model = _AudioLSTM()
+    model.load_state_dict(state_dict)
+    model.to(DEVICE).eval()
+    _LSTM_MODEL = model
+    return _LSTM_MODEL
+
+
+def models_loaded() -> dict:
+    """Return which models are currently loaded."""
+    return {
+        "resnet": _RESNET_MODEL is not None,
+        "lstm": _LSTM_MODEL is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inference: dual-model ensemble
+# ---------------------------------------------------------------------------
 
 @torch.inference_mode()
-def predict(tensor: torch.Tensor) -> Tuple[str, float]:
+def predict(
+    resnet_tensor: torch.Tensor,
+    lstm_tensor: torch.Tensor,
+) -> EnsemblePrediction:
     """
-    Run a single-sample forward pass and return the predicted class label
-    and confidence (probability of the predicted class).
-
-    Steps:
-      1. Add batch dimension (1, 1, 224, 224).
-      2. Move to device and run forward pass.
-      3. Apply softmax to logits to get probabilities.
-      4. Take argmax for class index and max probability for confidence.
-      5. Map class index to string label and return.
+    Run both models and compute the weighted ensemble prediction.
 
     Args:
-        tensor: Preprocessed mel spectrogram of shape (1, 224, 224), on CPU.
+        resnet_tensor: shape (1, 224, 224) — from preprocess_audio().
+        lstm_tensor:   shape (1, T, N_MELS) — from preprocess_audio().
 
     Returns:
-        (label, confidence) where label is "Real" or "AI Generated" and
-        confidence is a float in [0, 1].
+        EnsemblePrediction with individual and ensemble results.
 
     Raises:
-        RuntimeError: If the model has not been loaded (load_model not called).
-        ValueError: If the tensor shape is incorrect.
+        RuntimeError: If neither model is loaded.
     """
-    if _MODEL is None:
-        raise RuntimeError("Model not loaded. Call load_model() at startup.")
+    resnet_probs = None
+    lstm_probs = None
 
-    if tensor.ndim != 3:
-        raise ValueError(f"Expected 3D tensor (1, 224, 224), got ndim={tensor.ndim}")
-    if tensor.shape[0] != 1 or tensor.shape[1] != 224 or tensor.shape[2] != 224:
-        raise ValueError(f"Expected tensor shape (1, 224, 224), got {tuple(tensor.shape)}")
+    # ----- ResNet inference -----
+    if _RESNET_MODEL is not None:
+        batch = resnet_tensor.unsqueeze(0).to(DEVICE)  # (1, 1, 224, 224)
+        logits = _RESNET_MODEL(batch)
+        resnet_probs = torch.softmax(logits, dim=1).squeeze(0)  # (2,)
 
-    # Add batch dimension and move to device
-    batch = tensor.unsqueeze(0).to(DEVICE)
+    # ----- LSTM inference -----
+    if _LSTM_MODEL is not None:
+        batch = lstm_tensor.to(DEVICE)  # already (1, T, N_MELS)
+        logits = _LSTM_MODEL(batch)
+        lstm_probs = torch.softmax(logits, dim=1).squeeze(0)  # (2,)
 
-    logits = _MODEL(batch)
-    probs = torch.softmax(logits, dim=1).squeeze(0)
-    confidence, idx = torch.max(probs, dim=0)
-    confidence_val = float(confidence.item())
-    class_idx = int(idx.item())
+    # ----- Require at least one model -----
+    if resnet_probs is None and lstm_probs is None:
+        raise RuntimeError(
+            "No models loaded. Call load_resnet() and/or load_lstm() at startup."
+        )
 
-    label = CLASS_LABELS[class_idx]
-    return label, confidence_val
+    # ----- Individual predictions -----
+    def _label_and_conf(probs):
+        conf, idx = torch.max(probs, dim=0)
+        return CLASS_LABELS[int(idx.item())], round(float(conf.item()), 4)
+
+    if resnet_probs is not None:
+        resnet_label, resnet_conf = _label_and_conf(resnet_probs)
+    else:
+        resnet_label, resnet_conf = "N/A", 0.0
+
+    if lstm_probs is not None:
+        lstm_label, lstm_conf = _label_and_conf(lstm_probs)
+    else:
+        lstm_label, lstm_conf = "N/A", 0.0
+
+    # ----- Ensemble (weighted average of probability vectors) -----
+    if resnet_probs is not None and lstm_probs is not None:
+        ensemble_probs = RESNET_WEIGHT * resnet_probs + LSTM_WEIGHT * lstm_probs
+    elif resnet_probs is not None:
+        ensemble_probs = resnet_probs
+    else:
+        ensemble_probs = lstm_probs
+
+    ensemble_label, ensemble_conf = _label_and_conf(ensemble_probs)
+
+    return EnsemblePrediction(
+        resnet_prediction=resnet_label,
+        resnet_confidence=resnet_conf,
+        lstm_prediction=lstm_label,
+        lstm_confidence=lstm_conf,
+        ensemble_prediction=ensemble_label,
+        ensemble_confidence=ensemble_conf,
+    )

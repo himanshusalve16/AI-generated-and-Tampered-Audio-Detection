@@ -8,3 +8,4 @@ pydantic
 python-multipart
 scipy
 opencv-python
+matplotlib

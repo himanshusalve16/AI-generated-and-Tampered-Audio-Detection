@@ -1,13 +1,13 @@
 """
-Full training pipeline for the Audio Deepfake Detection model.
+Training pipeline for the Audio Deepfake Detection models.
 
-Loads audio from dataset/train/real and dataset/train/fake, applies the same preprocessing
-as the backend, trains a ResNet-18 with Adam and CrossEntropyLoss, and saves
-the best model (by validation accuracy) to models/audio_model.pth.
+Trains either a ResNet-18 (spectrogram image classifier) or a bidirectional
+LSTM (temporal sequence classifier) depending on the --model flag.
 
 Usage:
-  python train.py
-  python train.py --epochs 30 --batch-size 32 --lr 5e-5
+  python train.py --model resnet
+  python train.py --model lstm
+  python train.py --model resnet --epochs 30 --batch-size 32 --lr 5e-5
 """
 
 import argparse
@@ -24,23 +24,29 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Subset
 
 from dataset import AudioDataset
-from model import AudioResNet
+from model import AudioLSTM, AudioResNet
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Paths and defaults
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 TRAINING_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TRAINING_DIR.parent
 DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset"
 DEFAULT_MODELS_DIR = PROJECT_ROOT / "models"
-BEST_MODEL_FILENAME = "audio_model.pth"
+
+# Output filenames for each architecture
+MODEL_FILENAMES = {
+    "resnet": "resnet_audio_model.pth",
+    "lstm": "lstm_audio_model.pth",
+}
+
 DEFAULT_TRAIN_SUBDIR = "train"
 DEFAULT_TEST_SUBDIR = "test"
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Logging
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def setup_train_logging(verbose: bool = False) -> logging.Logger:
     level = logging.DEBUG if verbose else logging.INFO
@@ -54,9 +60,9 @@ def setup_train_logging(verbose: bool = False) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Training and validation loops
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def run_epoch_train(
     model: torch.nn.Module,
@@ -123,17 +129,18 @@ def run_epoch_val(
     }
 
 
-def _resolve_split_dirs(dataset_root: Path, train_subdir: str, test_subdir: str) -> Tuple[Path, Optional[Path]]:
+def _resolve_split_dirs(
+    dataset_root: Path, train_subdir: str, test_subdir: str
+) -> Tuple[Path, Optional[Path]]:
     """
     Resolve train/test directories.
 
     Preferred structure:
-      dataset_root/
-        train/real, train/fake
-        test/real,  test/fake
+      dataset_root/train/real, train/fake
+      dataset_root/test/real,  test/fake
 
     Backward-compatible fallback:
-      dataset_root/real, dataset_root/fake  (no separate test set)
+      dataset_root/real, dataset_root/fake (no separate test set)
     """
     train_dir = dataset_root / train_subdir
     test_dir = dataset_root / test_subdir
@@ -144,11 +151,32 @@ def _resolve_split_dirs(dataset_root: Path, train_subdir: str, test_subdir: str)
     return dataset_root, None
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def _build_model(arch: str) -> torch.nn.Module:
+    """Instantiate the requested architecture."""
+    if arch == "resnet":
+        return AudioResNet()
+    elif arch == "lstm":
+        return AudioLSTM(
+            input_dim=128,
+            hidden_dim=128,
+            num_layers=2,
+            num_classes=2,
+            dropout=0.3,
+        )
+    else:
+        raise ValueError(f"Unknown architecture: {arch}")
+
+
+# ---------------------------------------------------------------------------
 # Main training entry point
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def train(
+    architecture: str = "resnet",
     dataset_root: Optional[str] = None,
     models_dir: Optional[str] = None,
     train_subdir: str = DEFAULT_TRAIN_SUBDIR,
@@ -161,24 +189,26 @@ def train(
     verbose: bool = False,
 ) -> float:
     """
-    Run the full training pipeline.
+    Run the full training pipeline for a given architecture.
 
-    - Loads dataset and splits into train/validation.
-    - Uses DataLoader for batching.
-    - Trains with Adam and CrossEntropyLoss.
-    - Logs train/val loss and accuracy each epoch.
-    - Saves the best model (by validation accuracy) to models/audio_model.pth.
+    Args:
+        architecture: "resnet" or "lstm".
+        (other args same as before)
 
     Returns:
         Best validation accuracy achieved.
     """
     logger = setup_train_logging(verbose=verbose)
-    dataset_root = Path(dataset_root or DEFAULT_DATASET_ROOT)
-    models_dir = Path(models_dir or DEFAULT_MODELS_DIR)
-    models_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = models_dir / BEST_MODEL_FILENAME
+    dataset_root_path = Path(dataset_root or DEFAULT_DATASET_ROOT)
+    models_dir_path = Path(models_dir or DEFAULT_MODELS_DIR)
+    models_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Reproducibility (optional; can be overridden by env if needed)
+    if architecture not in MODEL_FILENAMES:
+        raise ValueError(f"architecture must be 'resnet' or 'lstm', got '{architecture}'")
+
+    best_model_path = models_dir_path / MODEL_FILENAMES[architecture]
+
+    # Reproducibility
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -188,21 +218,26 @@ def train(
     logger.info("Random seed: %d", seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Architecture: %s", architecture.upper())
     logger.info("Device: %s", device)
-    logger.info("Dataset root: %s", dataset_root)
-    logger.info("Models dir:   %s", models_dir)
-    logger.info("Batch size: %d, epochs: %d, lr: %s, val_split: %.2f", batch_size, num_epochs, learning_rate, val_split)
+    logger.info("Dataset root: %s", dataset_root_path)
+    logger.info("Models dir:   %s", models_dir_path)
+    logger.info(
+        "Batch size: %d, epochs: %d, lr: %s, val_split: %.2f",
+        batch_size, num_epochs, learning_rate, val_split,
+    )
 
-    train_dir, _ = _resolve_split_dirs(dataset_root, train_subdir=train_subdir, test_subdir=test_subdir)
+    train_dir, _ = _resolve_split_dirs(
+        dataset_root_path, train_subdir=train_subdir, test_subdir=test_subdir
+    )
     logger.info("Train dir: %s", train_dir)
 
-    # -------------------------------------------------------------------------
-    # Dataset subset mode (for faster experimentation)
-    # -------------------------------------------------------------------------
-    full_dataset = AudioDataset(train_dir)
+    # -----------------------------------------------------------------------
+    # Dataset with correct mode
+    # -----------------------------------------------------------------------
+    full_dataset = AudioDataset(train_dir, mode=architecture)
     total_available = len(full_dataset)
 
-    # Fixed seed for reproducible shuffling of indices
     g = torch.Generator()
     g.manual_seed(seed)
     all_indices = torch.randperm(total_available, generator=g).tolist()
@@ -214,11 +249,9 @@ def train(
     test_count = max_subset - train_count
 
     train_indices = subset_indices[:train_count]
-    test_indices = subset_indices[train_count:train_count + test_count]
+    test_indices = subset_indices[train_count : train_count + test_count]
 
     train_dataset = Subset(full_dataset, train_indices)
-    # No separate validation subset in subset mode; keep val loader structurally,
-    # but make it empty so training loop stays unchanged.
     val_dataset = Subset(full_dataset, [])
     test_dataset = Subset(full_dataset, test_indices) if test_count > 0 else None
 
@@ -251,7 +284,10 @@ def train(
             num_workers=num_workers,
         )
 
-    model = AudioResNet().to(device)
+    # -----------------------------------------------------------------------
+    # Model, optimizer, criterion
+    # -----------------------------------------------------------------------
+    model = _build_model(architecture).to(device)
     optimizer = Adam(model.parameters(), lr=learning_rate)
     criterion = CrossEntropyLoss()
 
@@ -268,12 +304,7 @@ def train(
 
         logger.info(
             "Epoch %03d/%03d | Train Loss: %.4f | Train Acc: %.4f | Val Loss: %.4f | Val Acc: %.4f",
-            epoch,
-            num_epochs,
-            train_loss,
-            train_acc,
-            val_loss,
-            val_acc,
+            epoch, num_epochs, train_loss, train_acc, val_loss, val_acc,
         )
 
         if val_acc > best_val_acc:
@@ -281,9 +312,7 @@ def train(
             torch.save(model.state_dict(), best_model_path)
             logger.info("  -> Best model saved to %s (val_acc=%.4f)", best_model_path, val_acc)
 
-    # In subset mode the validation loader can be effectively empty, so the
-    # val_acc condition above might never trigger and no checkpoint is saved.
-    # As a safeguard, ensure that we always have *some* model file to evaluate.
+    # Safeguard: always save at least the final epoch
     if not best_model_path.exists():
         torch.save(model.state_dict(), best_model_path)
         logger.info("No validation-based checkpoint found; saved final epoch model to %s", best_model_path)
@@ -304,24 +333,29 @@ def train(
     return best_val_acc
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # CLI
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Audio Deepfake Detection model (ResNet-18).")
-    parser.add_argument("--dataset", type=str, default=None, help="Path to dataset root (default: ../dataset)")
-    parser.add_argument(
-        "--train-subdir",
-        type=str,
-        default=DEFAULT_TRAIN_SUBDIR,
-        help="Subfolder under --dataset for training data (default: train). Ignored if --dataset points directly to a real/fake folder.",
+    parser = argparse.ArgumentParser(
+        description="Train Audio Deepfake Detection model (ResNet-18 or LSTM)."
     )
     parser.add_argument(
-        "--test-subdir",
+        "--model",
         type=str,
-        default=DEFAULT_TEST_SUBDIR,
-        help="Subfolder under --dataset for test data (default: test). If missing, test evaluation is skipped.",
+        choices=["resnet", "lstm"],
+        default="resnet",
+        help="Architecture to train: 'resnet' or 'lstm' (default: resnet)",
+    )
+    parser.add_argument("--dataset", type=str, default=None, help="Path to dataset root (default: ../dataset)")
+    parser.add_argument(
+        "--train-subdir", type=str, default=DEFAULT_TRAIN_SUBDIR,
+        help="Subfolder under --dataset for training data (default: train).",
+    )
+    parser.add_argument(
+        "--test-subdir", type=str, default=DEFAULT_TEST_SUBDIR,
+        help="Subfolder under --dataset for test data (default: test).",
     )
     parser.add_argument("--models-dir", type=str, default=None, help="Directory to save model (default: ../models)")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size for training")
@@ -336,6 +370,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     train(
+        architecture=args.model,
         dataset_root=args.dataset,
         models_dir=args.models_dir,
         train_subdir=args.train_subdir,

@@ -9,8 +9,7 @@ function App() {
   const [file, setFile] = useState(null);
   const [audioUrl, setAudioUrl] = useState('');
   const [loading, setLoading] = useState(false);
-  const [prediction, setPrediction] = useState(null);
-  const [confidence, setConfidence] = useState(null);
+  const [result, setResult] = useState(null);   // full ensemble result object
   const [error, setError] = useState('');
 
   const containerRef = useRef(null);
@@ -33,8 +32,7 @@ function App() {
 
   const handleFileChange = (event) => {
     const selectedFile = event.target.files?.[0];
-    setPrediction(null);
-    setConfidence(null);
+    setResult(null);
     setError('');
 
     if (!selectedFile) {
@@ -56,8 +54,7 @@ function App() {
 
     setLoading(true);
     setError('');
-    setPrediction(null);
-    setConfidence(null);
+    setResult(null);
 
     try {
       const formData = new FormData();
@@ -69,9 +66,8 @@ function App() {
         }
       });
 
-      const { label, confidence: score } = response.data;
-      setPrediction(label);
-      setConfidence(typeof score === 'number' ? score : null);
+      // Store the full ensemble response
+      setResult(response.data);
     } catch (err) {
       if (err.response && err.response.data && err.response.data.detail) {
         setError(`Server error: ${err.response.data.detail}`);
@@ -87,7 +83,7 @@ function App() {
     <div className="min-h-screen flex items-center justify-center px-4 py-8 bg-transparent font-sans">
       <div
         ref={containerRef}
-        className="relative w-full max-w-5xl rounded-3xl bg-slate-900/70 border border-slate-700/60 shadow-2xl shadow-sky-500/10 backdrop-blur-2xl p-6 md:p-8 overflow-hidden"
+        className="relative w-full max-w-6xl rounded-3xl bg-slate-900/70 border border-slate-700/60 shadow-2xl shadow-sky-500/10 backdrop-blur-2xl p-6 md:p-8 overflow-hidden"
       >
         <div className="pointer-events-none absolute -top-32 -right-16 h-72 w-72 rounded-full bg-sky-500/10 blur-3xl" />
         <div className="pointer-events-none absolute -bottom-24 -left-10 h-64 w-64 rounded-full bg-cyan-400/10 blur-3xl" />
@@ -96,20 +92,20 @@ function App() {
           <div>
             <div className="inline-flex items-center gap-2 rounded-full border border-sky-500/30 bg-slate-900/60 px-3 py-1 text-xs font-medium text-sky-200 shadow-glow-blue">
               <Sparkles className="h-3.5 w-3.5 text-sky-300" />
-              <span>Deep Learning Lab · ResNet-18</span>
+              <span>Deep Learning Lab · ResNet-18 + LSTM Ensemble</span>
             </div>
             <h1 className="mt-4 text-2xl md:text-3xl font-semibold text-slate-50 tracking-tight flex items-center gap-2">
               <Waves className="h-7 w-7 text-sky-400" />
               AI-Generated &amp; Tampered Audio Detection
             </h1>
             <p className="mt-2 text-sm md:text-base text-slate-300 max-w-2xl">
-              Upload a short audio clip to analyze mel-spectrogram features with a ResNet-18 model
-              and estimate whether it is real human speech or AI-generated.
+              Upload a short audio clip to analyze mel-spectrogram features with a
+              ResNet-18 + LSTM ensemble and estimate whether it is real human speech or AI-generated.
             </p>
           </div>
         </header>
 
-        <main className="relative z-10 grid gap-6 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+        <main className="relative z-10 grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
           <UploadCard
             file={file}
             audioUrl={audioUrl}
@@ -119,7 +115,7 @@ function App() {
             onUpload={handleUpload}
           />
 
-          <ResultCard prediction={prediction} confidence={confidence} loading={loading} />
+          <ResultCard result={result} loading={loading} />
         </main>
       </div>
     </div>

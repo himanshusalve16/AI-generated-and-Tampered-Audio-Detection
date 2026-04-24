@@ -1,573 +1,295 @@
-## AI-Generated and Tampered Audio Detection
+# AI-Generated and Tampered Audio Detection
 
-**AI-Generated and Tampered Audio Detection using Spectral Feature Analysis and Deep Learning**
+**Using Spectral Feature Analysis and Deep Learning**
 
-This project is a full‑stack system that detects whether an uploaded audio file is:
-
-- **Real human speech**, or  
-- **AI-generated / tampered speech**
-
-It combines:
-
-- **Frontend**: React (Vite) + Tailwind CSS + GSAP + Lucide React (modern animated UI)
-- **Backend**: FastAPI (REST API + inference)
-- **Audio Processing**: Librosa (mel‑spectrograms)
-- **Deep Learning**: PyTorch + ResNet‑18 (binary classifier)
-- **Training Module**: Separate training pipeline for reproducible experiments
+A full-stack web application that detects AI-generated or tampered audio using a **ResNet-18 + LSTM ensemble** trained on mel-spectrogram features. Upload a short speech clip, and the system will classify it as **Real** or **AI Generated** with confidence scores from two independent deep learning models.
 
 ---
 
-## 1. High-Level Architecture
+## Problem Statement
 
-**Flow:**
+The rapid advancement of AI voice synthesis (text-to-speech, voice cloning, deepfake audio) has made it increasingly difficult to distinguish real human speech from machine-generated audio. This project addresses the challenge of **automatic audio authenticity verification** by combining two complementary deep learning approaches.
 
-1. User uploads `.wav` / `.mp3` in the **React frontend**.
-2. Frontend sends the file via `POST /predict` to the **FastAPI backend**.
-3. Backend:
-   - Preprocesses audio into a **log-mel spectrogram** tensor.
-   - Runs inference with a **ResNet‑18** binary classifier.
-   - Returns JSON with **prediction** (`"Real"` / `"AI-Generated"`) and **confidence**.
-4. Frontend displays the result with a dark, animated UI.
+## Motivation
 
-**Ports:**
-
-- **Frontend**: `http://localhost:5173`
-- **Backend**: `http://localhost:8000`
+- AI-generated speech is being misused for fraud, misinformation, and identity theft.
+- Single-model classifiers can be brittle — an ensemble of architecturally different models provides more robust detection.
+- Mel-spectrogram analysis captures both spatial (frequency domain patterns) and temporal (time-series dynamics) anomalies left by audio generation algorithms.
 
 ---
 
-## 2. Project Structure
+## System Architecture
 
-```text
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         FRONTEND (React)                         │
+│  Upload audio → Preview → Send to API → Display ensemble results │
+│  Show spectrogram image, ResNet card, LSTM card, Ensemble card   │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │  HTTP POST /predict (multipart file)
+                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      BACKEND (FastAPI)                            │
+│                                                                  │
+│  1. Validate uploaded audio file                                 │
+│  2. Preprocess (preprocess.py):                                  │
+│     • Resample to 16 kHz mono                                    │
+│     • Trim silence, pad/crop to 3 seconds                        │
+│     • Compute mel spectrogram (128 mel bands)                    │
+│     • Generate:                                                  │
+│       - ResNet tensor (1, 224, 224)                               │
+│       - LSTM tensor (1, 94, 128)                                 │
+│       - Base64 spectrogram PNG                                   │
+│                                                                  │
+│  3. Inference (model_loader.py):                                 │
+│     • ResNet-18 → softmax probabilities                          │
+│     • LSTM (BiLSTM) → softmax probabilities                      │
+│     • Weighted ensemble (configurable weights)                   │
+│                                                                  │
+│  4. Return JSON response with all predictions                    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+1. **User** selects an audio file (WAV, MP3, etc.) in the React frontend.
+2. **Frontend** sends the file via `POST /predict` to the FastAPI backend.
+3. **Backend** preprocesses the audio once and produces tensors for both models.
+4. **ResNet-18** receives a 224×224 mel-spectrogram image and classifies spatial patterns.
+5. **LSTM** receives a (94, 128) temporal mel sequence and classifies time-series dynamics.
+6. **Ensemble** merges both probability vectors via weighted averaging.
+7. **Response** JSON is sent back containing individual predictions, confidence scores, and the spectrogram image.
+8. **Frontend** displays the spectrogram and three prediction cards (ResNet, LSTM, Ensemble).
+
+---
+
+## Features
+
+- **Dual-model ensemble** — ResNet-18 (CNN) + Bidirectional LSTM (RNN) for robust detection.
+- **Individual model predictions** — See what each model thinks independently.
+- **Ensemble final prediction** — Weighted average of both models' softmax probabilities.
+- **Spectrogram visualization** — The mel spectrogram used by ResNet is displayed on the dashboard.
+- **Audio preview** — Listen to the uploaded clip directly in the browser.
+- **Configurable ensemble weights** — Adjust model trust in `backend/config.py`.
+- **Modern dark-themed UI** — Glassmorphism, GSAP animations, responsive layout.
+
+---
+
+## Tech Stack
+
+| Layer       | Technology                              |
+|-------------|----------------------------------------|
+| **Frontend** | React 18, Tailwind CSS 3, GSAP, Lucide Icons, Vite |
+| **Backend**  | FastAPI, Uvicorn, Python 3.10+          |
+| **Deep Learning** | PyTorch, torchvision, librosa      |
+| **Visualization** | matplotlib (server-side spectrogram rendering) |
+
+---
+
+## Folder Structure
+
+```
 DL Project/
-  frontend/          # React (Vite) SPA UI (do not modify)
-    src/
-      main.jsx
-      App.jsx
-      index.css
-      components/
-        UploadCard.jsx
-        ResultCard.jsx
-    package.json
-    vite.config.mjs
-    tailwind.config.mjs
-    postcss.config.mjs
-    index.html
-
-  backend/           # FastAPI API + inference
-    main.py          # App, CORS, /health, /predict, lifespan, logging, validation
-    preprocess.py    # Audio → mel spectrogram → (1, 224, 224) tensor
-    model_loader.py  # ResNet-18 load + predict() with softmax
-    utils.py         # Logging, file validation, constants, paths
-    requirements.txt
-
-  training/          # Training-only code (no API)
-    dataset.py       # AudioDataset (real/fake), same preprocessing as backend
-    model.py         # AudioResNet (ResNet-18, 1-channel, 2 classes)
-    train.py         # Train/val loops, metrics, CLI, best model save
-
-  dataset/           # (You create this)
-    train/
-      real/          # Real speech audio clips (training split)
-      fake/          # AI-generated / tampered clips (training split)
-    test/
-      real/          # Real speech audio clips (test split)
-      fake/          # AI-generated / tampered clips (test split)
-
-  models/
-    audio_model.pth  # (Created after training; used by backend at startup)
+├── backend/                  # FastAPI backend
+│   ├── config.py             # Centralized constants (paths, dims, weights)
+│   ├── main.py               # FastAPI app, endpoints, lifecycle
+│   ├── model_loader.py       # Dual model loading + ensemble inference
+│   ├── preprocess.py         # Audio → ResNet tensor + LSTM tensor + spectrogram
+│   ├── utils.py              # Logging, validation, helpers
+│   └── requirements.txt      # Python dependencies
+│
+├── frontend/                 # React frontend (Vite)
+│   ├── src/
+│   │   ├── App.jsx           # Main layout and API call
+│   │   ├── components/
+│   │   │   ├── UploadCard.jsx    # File upload + audio preview
+│   │   │   └── ResultCard.jsx    # Spectrogram + 3 prediction cards
+│   │   ├── App.css           # Additional styles
+│   │   ├── index.css         # Tailwind base + body background
+│   │   └── main.jsx          # React entry point
+│   ├── index.html
+│   ├── package.json
+│   ├── tailwind.config.mjs
+│   └── vite.config.mjs
+│
+├── training/                 # Model training pipeline
+│   ├── train.py              # CLI training script (--model resnet|lstm)
+│   ├── model.py              # AudioResNet + AudioLSTM definitions
+│   └── dataset.py            # PyTorch Dataset with resnet/lstm modes
+│
+├── models/                   # Trained weight files
+│   ├── resnet_audio_model.pth
+│   └── lstm_audio_model.pth
+│
+├── dataset/                  # Training data (not committed)
+│   └── train/
+│       ├── real/             # Real audio files
+│       └── fake/             # AI-generated audio files
+│
+└── README.md                 # This file
 ```
-
-- **frontend/** – UI only (upload, preview, call `/predict`, display result)  
-- **backend/** – API + inference only (modular, with logging and validation)  
-- **training/** – training pipeline only (dataset, model, train script with CLI)  
-- **models/** – saved weights only  
 
 ---
 
-## 3. Frontend (React + Vite + Tailwind + GSAP)
+## Setup Instructions
 
-### 3.1 Tech Stack
+### Prerequisites
 
-- **React 18** – functional components and hooks
-- **Vite** – fast dev server and build
-- **Tailwind CSS** – utility-first modern styling
-- **GSAP** – smooth entrance and result animations
-- **Lucide React** – icons
-- **Axios** – HTTP client for API calls
+- Python 3.10 or higher
+- Node.js 18+ and npm
+- (Optional) NVIDIA GPU with CUDA for faster training
 
-### 3.2 Features
+### 1. Clone the repository
 
-- Single page app:
-  - **File input** for `.wav` / `.mp3`
-  - **Audio preview** using `<audio>` element
-  - **Analyze audio** button
-  - **Loading state** while prediction is running
-  - **Prediction display**: “Real” or “AI-Generated”
-  - **Confidence score** display (percentage + bar)
-- Modern dark UI:
-  - Gradient background + glassmorphism center card
-  - GSAP entrance animation for the main card
-  - Animated button hover/click
-  - Fade-in animation when prediction appears
-  - Icons for upload, audio file, status, and confidence
-
-### 3.3 Frontend API Contract
-
-- **Endpoint**: `POST http://localhost:8000/predict`
-- **Request**:
-  - `Content-Type: multipart/form-data`
-  - Field: `file` (audio file)
-- **Response (backend returns)**:
-
-```json
-{
-  "label": "Real",
-  "confidence": 0.93
-}
+```bash
+git clone <repository-url>
+cd "DL Project"
 ```
 
-The frontend reads `label` and `confidence` from the response to display the prediction and confidence score.
+### 2. Backend setup
 
-### 3.4 Running the Frontend
+```bash
+cd backend
+pip install -r requirements.txt
+```
 
-From the project root:
+### 3. Frontend setup
 
 ```bash
 cd frontend
 npm install
-npm run dev
 ```
 
-Open the URL printed by Vite (typically `http://localhost:5173`).
+### 4. Train models
 
----
-
-## 4. Backend (FastAPI + Librosa + PyTorch)
-
-### 4.1 Tech Stack
-
-- **FastAPI** – web framework with request validation and error handling
-- **Uvicorn** – ASGI server
-- **Librosa** – audio loading and mel-spectrogram extraction
-- **NumPy** – array operations
-- **PyTorch** + **Torchvision** – ResNet-18 and tensors
-
-The backend uses a **modular architecture**: `utils.py` provides structured logging, file validation (size, extension, content type), and path constants; `main.py` wires endpoints and lifecycle; `preprocess.py` and `model_loader.py` handle audio and inference.
-
-### 4.2 Installing Backend Dependencies
-
-From the project root:
-
-```bash
-cd backend
-pip install -r requirements.txt
-```
-
-### 4.3 Running the Backend
-
-From `backend/`:
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-API base URL: `http://localhost:8000`
-
-### 4.4 CORS Configuration
-
-`main.py` configures CORS so the React frontend can call the API:
-
-- **Allowed origins**: `http://localhost:5173` (from `utils.CORS_ORIGINS`)
-- **Methods**: GET, POST, OPTIONS
-- **Headers**: all
-
----
-
-## 5. Backend Endpoints
-
-### 5.1 `GET /health`
-
-- Health check for monitoring and load balancers.
-- Response:
-
-```json
-{ "status": "ok" }
-```
-
-### 5.2 `POST /predict`
-
-- **Parameter**: `file` (UploadFile) – audio file (e.g. WAV, MP3, FLAC).
-- **Request validation** (in `utils.validate_audio_upload`):
-  - Non-empty filename and file size > 0.
-  - Max size: 50 MB.
-  - Allowed extensions: `.wav`, `.mp3`, `.flac`, `.ogg`, `.m4a`, `.webm`.
-  - Allowed content types: common `audio/*` and `application/octet-stream`.
-- **Processing steps**:
-  1. Validate uploaded file (size, type, extension).
-  2. Load audio and preprocess via `preprocess_audio()` → tensor `(1, 224, 224)`.
-  3. Run `model_loader.predict(tensor)` → `(label, confidence)`.
-  4. Return JSON (frontend expects `label` and `confidence`):
-
-```json
-{
-  "label": "Real",
-  "confidence": 0.85
-}
-```
-
-- **If the model is not loaded** (e.g. `models/audio_model.pth` missing): the server still starts, but `/predict` returns **503** with a message to train and place the model, then restart.
-- **Error handling**: validation errors (400), processing/inference errors (422), model-not-loaded (503), and unexpected errors (500). All errors include a `detail` message; structured logging records failures.
-
----
-
-## 6. Audio Preprocessing (`backend/preprocess.py`)
-
-Preprocessing is **modular**: each step is a small function so the pipeline is easy to follow and keep in sync with the training dataset.
-
-### 6.1 Constants (must match `training/dataset.py`)
-
-- `TARGET_SR = 16000`, `TARGET_DURATION_SEC = 3.0`, `TARGET_NUM_SAMPLES = 48000`
-- `TARGET_SIZE = 224` (output height and width)
-- `N_FFT = 1024`, `HOP_LENGTH = 512`, `N_MELS = 128`, `POWER = 2.0`, `TRIM_TOP_DB = 20`
-
-### 6.2 Function: `preprocess_audio(file)`
-
-- **Input**: `file` can be a binary file-like object, raw `bytes`, or a `str` path to an audio file.
-- **Output**: `torch.Tensor` of shape `(1, 224, 224)`, float32, CPU.
-
-**Steps (implemented as helpers):**
-
-1. **Load & resample** – `librosa.load(..., sr=TARGET_SR, mono=True)` (16 kHz, mono).
-2. **Trim silence** – `_trim_silence(y)` using `librosa.effects.trim(y, top_db=TRIM_TOP_DB)`.
-3. **Pad / crop** – `_pad_or_crop_to_fixed_length(y, TARGET_NUM_SAMPLES)` (3 seconds).
-4. **Mel spectrogram** – `_compute_mel_spectrogram(y)` with the constants above.
-5. **Log scale** – `_to_log_scale(mel_spec)` → `librosa.power_to_db(..., ref=np.max)`.
-6. **Normalize** – `_normalize_spectrogram(mel_db)` (zero mean, unit variance per spectrogram).
-7. **To tensor and resize** – `_resize_to_target(..., 224, 224)` with `F.interpolate` (bilinear).
-8. **Return** – tensor shape `(1, 224, 224)` for the ResNet-18 input.
-
----
-
-## 7. Model Loading & Inference (`backend/model_loader.py`)
-
-### 7.1 Model Architecture
-
-- Base model: `resnet18(weights=None)` from `torchvision.models`.
-- Modifications:
-  - **First convolution**: 1-channel instead of 3-channel RGB.
-  - **Final fully connected layer**: 2 outputs (binary classification).
-
-This architecture is also used in the training module.
-
-### 7.2 Weights and Device
-
-- Weights file:
-
-```text
-models/audio_model.pth
-```
-
-- Device:
-  - Uses GPU (`cuda`) if available, else CPU.
-
-### 7.3 One-Time Model Loading
-
-- `load_model()`:
-  - Builds the modified ResNet‑18.
-  - Loads `state_dict` from `audio_model.pth`.
-  - Moves model to the correct device.
-  - Sets `model.eval()`.
-  - Caches the model in a module-level variable so it is **not reloaded per request**.
-  - Called once on FastAPI startup.
-
-### 7.4 Prediction Function
-
-```python
-def predict(tensor: torch.Tensor) -> Tuple[str, float]:
-    # tensor shape: (1, 224, 224)
-    # 1. Add batch dimension -> (1, 1, 224, 224), move to device
-    # 2. Forward pass (logits)
-    # 3. Softmax -> probabilities
-    # 4. Argmax for class index, max prob for confidence
-    # 5. Map index to CLASS_LABELS: 0 -> "Real", 1 -> "AI Generated"
-```
-
-- **Returns**: `(label, confidence)` where `label` is `"Real"` or `"AI Generated"` and `confidence` is in [0, 1].
-- **Raises**: `RuntimeError` if the model was not loaded; `ValueError` if the tensor shape is not `(1, 224, 224)`.
-
----
-
-## 8. Training Pipeline (`training/`)
-
-Training code is **separate** from the backend and not imported by the API.
-
-### 8.1 Dataset (`training/dataset.py`)
-
-Expected folder structure (recommended):
-
-```text
-dataset/
-  train/
-    real/   # label 0 (Real)
-    fake/   # label 1 (AI Generated / Fake)
-  test/
-    real/   # label 0 (Real)
-    fake/   # label 1 (AI Generated / Fake)
-```
-
-Notes:
-
-- For **fast experiments on CPU**, the training script runs in **subset mode** (see section 8.4): it samples at most 1000 files from `dataset/train/*` automatically.
-- In subset mode, those 1000 files are split into **800 training** and **200 internal test** samples.
-- The original dataset on disk is never modified or deleted.
-- Backward-compatible: if you only have `dataset/real` and `dataset/fake`, training will still work (subset is taken from there).
-
-**AudioDataset**:
-
-- Constructor: `root_dir`, optional `real_subdir`/`fake_subdir`, and optional `extensions` filter.
-- Scans both subdirs and builds a list of `(path, label)`.
-- **Preprocessing** is identical to `backend/preprocess.py`: same constants and step-by-step helpers (`_trim_silence`, `_pad_or_crop_to_fixed_length`, mel spectrogram, log scale, normalize, resize). The shared helper is `waveform_to_tensor(y)`.
-- `__getitem__(idx)` loads the file with librosa (sr=16000, mono), then `waveform_to_tensor(y)` → tensor `(1, 224, 224)` and integer label 0 or 1.
-- Raises `FileNotFoundError` if `real/` or `fake/` is missing, and `ValueError` if no files are found.
-
-### 8.2 Model (`training/model.py`)
-
-- `AudioResNet`:
-  - Wraps modified ResNet‑18:
-    - Input: 1-channel
-    - Output: 2 classes
-  - `forward(x)` simply calls the underlying ResNet.
-
-### 8.3 Training Script (`training/train.py`)
-
-**Default configuration:**
-
-- `dataset_root` = project root `dataset/` (expects `train/` + optional `test/` inside)
-- `models_dir` = project root `models/`
-- `batch_size = 16`
-- `num_epochs = 25`
-- `learning_rate = 1e-4`
-- `val_split = 0.2`
-- `num_workers = 0`
-- Random seed: `42` (for reproducibility)
-
-**CLI options:**
-
-```bash
-python train.py [--dataset PATH] [--train-subdir train] [--test-subdir test] [--models-dir PATH] [--batch-size N] [--epochs N] [--lr FLOAT] [--val-split FLOAT] [--num-workers N] [--verbose]
-```
-
-**Training steps:**
-
-1. Set up logging and random seed (numpy, torch, CUDA if available).
-2. Load `AudioDataset` from `dataset/train` into memory as `full_dataset`.
-3. **Subset mode**: shuffle indices with a fixed seed (42), take at most 1000 samples, then:
-   - First 800 indices → **training subset**
-   - Remaining (up to 200) indices → **internal test subset**
-4. Wrap these subsets in `torch.utils.data.Subset` and build `DataLoader`s:
-   - `train_loader` over the 800 training samples (shuffled each epoch).
-   - `val_loader` is kept structurally but is effectively empty in subset mode (metrics are logged but not meaningful).
-   - `test_loader` over the 200 internal test samples (used after training completes).
-5. Instantiate `AudioResNet`, `Adam`, `CrossEntropyLoss`.
-6. For each epoch:
-   - **Train**: `run_epoch_train()` – forward, loss, backward, step; aggregate loss and accuracy on the 800-sample subset.
-   - **Validation**: `run_epoch_val()` – runs on the (empty) validation loader in subset mode (values default to zeros).
-   - Log: `Epoch xxx/xxx | Train Loss: ... | Train Acc: ... | Val Loss: ... | Val Acc: ...`
-   - If validation accuracy improves: save `model.state_dict()` to `models/audio_model.pth` and log that the best model was saved.
-7. After all epochs, log the best validation accuracy and path to the saved model.
-8. Reload the best checkpoint and evaluate once on the **200-sample internal test subset**, logging test loss/accuracy.
-
-**Run training (subset mode)** – from project root or `training/`:
+Place your audio dataset under `dataset/train/real/` and `dataset/train/fake/`, then:
 
 ```bash
 cd training
-python train.py
-# Or with options (subset size stays 1000 max):
-python train.py --epochs 10 --batch-size 8 --lr 5e-5
+
+# Train ResNet-18
+python train.py --model resnet --epochs 25 --batch-size 16
+
+# Train LSTM
+python train.py --model lstm --epochs 25 --batch-size 16
 ```
 
-After training, place or keep `audio_model.pth` in `models/` and (re)start the backend so it loads the new weights at startup.
+Model weights will be saved to `models/resnet_audio_model.pth` and `models/lstm_audio_model.pth`.
 
-### 8.4 Subset Training Mode (Fast CPU Experiments)
-
-Because the full dataset is large (~22k+ samples), training on CPU can be very slow.  
-To make experimentation practical, `train.py` automatically enables a **subset training mode**:
-
-- **Where the data comes from**
-  - Uses `AudioDataset(train_dir)` where `train_dir` is typically `dataset/train`.
-  - Reads the full list of real/fake files but **does not modify or delete** any files.
-
-- **How the subset is chosen**
-  - A fixed seed `42` is used for all randomness (`random`, `numpy`, and `torch`).
-  - A `torch.Generator` with seed 42 generates a random permutation of all sample indices.
-  - At most **1000 indices** are kept:
-    - If your dataset has ≥ 1000 files → exactly 1000 are used.
-    - If it has < 1000 files → all are used.
-
-- **Train/test split inside the subset**
-  - First **800** indices → **training subset**.
-  - Remaining (up to **200**) indices → **internal test subset**.
-  - Those are wrapped in `Subset(full_dataset, indices)` and fed to `DataLoader`.
-
-- **Reproducibility**
-  - Because the seed is fixed at 42 and the same shuffling process is used each run,  
-    the **same 1000 files** (and same 800/200 split) are selected every time, as long as the underlying file list does not change.
-
-- **Logging**
-  - At startup, you will see logs like:
-
-    ```text
-    Dataset subset mode enabled
-    Available samples in train dir: 22245
-    Total samples used: 1000
-    Training samples: 800
-    Testing samples: 200
-    ```
-
-- **What the metrics mean**
-  - Epoch logs (`Train Loss`, `Train Acc`, `Val Loss`, `Val Acc`) are based on the **800-sample training subset**.
-  - Validation metrics in subset mode come from an effectively empty loader and are not meaningful.
-  - Final `Test set | Loss | Acc` logs are computed on the **200-sample internal test subset**.
-
----
-
-## 9. End-to-End Setup Instructions
-
-## 9.1 Quickstart (Windows / PowerShell)
-
-From the project root (`d:\DL Project`):
+### 5. Run the backend
 
 ```bash
-# 1) Create & activate venv (recommended)
-python -m venv .venv
-.venv\Scripts\activate
-
-# 2) Install backend deps (includes training deps too)
-cd backend
-pip install -r requirements.txt
-cd ..
-
-# 3) Prepare dataset (required)
-# dataset/train/real, dataset/train/fake, dataset/test/real, dataset/test/fake
-
-# 4) Train with subset mode (saves models/audio_model.pth)
-cd training
-python train.py --epochs 10 --batch-size 8
-cd ..
-
-# 5) Run backend (loads models/audio_model.pth on startup)
 cd backend
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-# 6) In a new terminal: run frontend
+### 6. Run the frontend
+
+```bash
 cd frontend
-npm install
-npm run dev
-```
-
----
-
-1. **Clone / open the project folder** (already at `d:\DL Project`).
-2. **(Optional but recommended) Create a virtual environment**:
-
-```bash
-cd "d:\DL Project"
-python -m venv .venv
-.venv\Scripts\activate    # On Windows PowerShell
-```
-
-3. **Prepare dataset**:
-
-```text
-d:\DL Project\dataset\train\real\   # real speech audio files (training split)
-d:\DL Project\dataset\train\fake\   # AI / tampered audio files (training split)
-d:\DL Project\dataset\test\real\    # real speech audio files (test split)
-d:\DL Project\dataset\test\fake\    # AI / tampered audio files (test split)
-```
-
-4. **Install backend + training dependencies**:
-
-```bash
-cd backend
-pip install -r requirements.txt
-```
-
-5. **(Optional) Train the model**:
-
-```bash
-cd ../training
-python train.py
-# Optional flags:
-# python train.py --epochs 30 --batch-size 32 --lr 5e-5
-# python train.py --dataset "../dataset" --train-subdir train --test-subdir test
-```
-
-Confirm that `../models/audio_model.pth` is created.
-
-6. **Run FastAPI backend**:
-
-```bash
-cd ../backend
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Check health:
-
-```text
-http://localhost:8000/health   -> { "status": "ok" }
-```
-
-7. **Install and run frontend**:
-
-```bash
-cd ../frontend
-npm install
 npm run dev
 ```
 
 Open `http://localhost:5173` in your browser.
 
-8. **Use the system**:
+---
 
-- Upload a `.wav` or `.mp3` speech clip in the UI.
-- Click **“Analyze audio”**.
-- The frontend sends a request to `POST http://localhost:8000/predict`.
-- The backend preprocesses the audio, runs ResNet‑18, and responds with:
+## Model Details
 
-```json
-{
-  "label": "Real",
-  "confidence": 0.85
-}
+### ResNet-18 (Spectrogram Image Classifier)
+
+| Property       | Value                                     |
+|----------------|-------------------------------------------|
+| Architecture   | ResNet-18 (modified: 1-channel input, 2-class output) |
+| Input          | Mel spectrogram image `(1, 224, 224)`     |
+| Features       | 128 mel bands, 1024 FFT, 512 hop length   |
+| Preprocessing  | Log-dB, z-score normalization, bilinear resize |
+| Output         | 2 logits → softmax → [P(Real), P(Fake)]  |
+
+### LSTM (Temporal Sequence Classifier)
+
+| Property       | Value                                     |
+|----------------|-------------------------------------------|
+| Architecture   | 2-layer Bidirectional LSTM + FC classifier |
+| Input          | Mel-spectrogram time series `(94, 128)`   |
+| Features       | Same mel spectrogram (transposed, no resize) |
+| Hidden dim     | 128 per direction (256 total)             |
+| Dropout        | 0.3                                       |
+| Output         | 2 logits → softmax → [P(Real), P(Fake)]  |
+
+### Ensemble Strategy
+
+Both models produce softmax probability vectors `[P(Real), P(Fake)]`. The ensemble computes a weighted average:
+
+```
+ensemble_probs = w_resnet × resnet_probs + w_lstm × lstm_probs
 ```
 
-- The frontend displays the label and confidence with smooth animations.
+Default weights: `w_resnet = 0.5`, `w_lstm = 0.5` (configurable in `backend/config.py`).
 
 ---
 
-## 10. How to Explain in Viva
+## API Documentation
 
-- **Core idea**:  
-  Convert raw audio into a **mel-spectrogram image** and use a **CNN (ResNet‑18)** to classify real vs AI-generated/tampered speech.
+### `GET /health`
 
-- **Spectral features**:
-  - Mel-spectrogram captures **time–frequency** patterns of speech.
-  - Log scaling and normalization stabilize inputs for the neural network.
+Health check. Returns model loading status.
 
-- **Model**:
-  - ResNet‑18 is a standard CNN architecture, modified for 1-channel input and 2 outputs.
-  - Training uses **CrossEntropyLoss** and **Adam** optimizer.
+**Response:**
+```json
+{
+  "status": "ok",
+  "models": {
+    "resnet": true,
+    "lstm": true
+  }
+}
+```
 
-- **Clean architecture**:
-  - `frontend/` (UI), `backend/` (API + inference), `training/` (training), `models/` (weights).
-  - Same preprocessing in training and inference.
-  - Model is loaded once at backend startup for efficiency.
+### `POST /predict`
 
-- **Full-stack integration**:
-  - React frontend → FastAPI backend via REST.
-  - CORS allows only the frontend origin.
-  - Responses are simple JSON, easy to log and interpret.
+Upload an audio file and receive an ensemble prediction.
 
-This structure is minimal, modular, and ready to be explained step-by-step during viva or project demonstration.
+**Request:** Multipart form data with a `file` field containing the audio file.
 
+**Response:**
+```json
+{
+  "resnet_prediction": "Real",
+  "resnet_confidence": 0.91,
+  "lstm_prediction": "AI Generated",
+  "lstm_confidence": 0.87,
+  "ensemble_prediction": "AI Generated",
+  "ensemble_confidence": 0.89,
+  "spectrogram_image": "data:image/png;base64,..."
+}
+```
+
+**Error responses:**
+- `400` — Invalid file (empty, wrong type, too large)
+- `422` — Audio processing error
+- `503` — No models loaded
+- `500` — Internal server error
+
+---
+
+## Screenshots
+
+> Screenshots will be added after the UI is finalized. The dashboard shows:
+> - Audio upload card with preview player
+> - Mel spectrogram visualization
+> - Three prediction cards: ResNet-18, LSTM, and Ensemble
+> - Confidence bars with gradient colors
+
+---
+
+## Future Improvements
+
+- Add support for longer audio clips with sliding-window analysis.
+- Implement attention mechanisms in the LSTM for interpretability.
+- Add a third model (e.g., wav2vec2) for a stronger ensemble.
+- Provide Grad-CAM visualizations on the spectrogram.
+- Deploy to cloud with Docker containerization.
+- Add user authentication and prediction history.
+- Support real-time microphone input.
+- Fine-tune ensemble weights using a validation set (learned fusion).

@@ -9,6 +9,13 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+from config import (
+    RESNET_MODEL_PATH,
+    LSTM_MODEL_PATH,
+    LEGACY_MODEL_PATH,
+    MODELS_DIR,
+)
+
 # -----------------------------------------------------------------------------
 # Constants used across the backend
 # -----------------------------------------------------------------------------
@@ -17,9 +24,9 @@ from typing import Any, Optional, Tuple
 API_TITLE = "Audio Deepfake Detection API"
 API_DESCRIPTION = (
     "Detect real vs AI-generated or tampered audio using "
-    "spectral feature analysis and a ResNet-18 deep learning model."
+    "spectral feature analysis with a ResNet-18 + LSTM ensemble."
 )
-API_VERSION = "1.0.0"
+API_VERSION = "2.0.0"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 
@@ -41,14 +48,6 @@ ALLOWED_CONTENT_TYPES = {
     "audio/webm",
     "application/octet-stream",  # some clients send this for binary uploads
 }
-
-# Model and paths
-MODEL_FILENAME = "audio_model.pth"
-# Base directory is the project root (parent of backend/)
-BACKEND_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BACKEND_DIR.parent
-MODELS_DIR = PROJECT_ROOT / "models"
-DEFAULT_MODEL_PATH = MODELS_DIR / MODEL_FILENAME
 
 
 # -----------------------------------------------------------------------------
@@ -140,8 +139,15 @@ def ensure_models_directory() -> Path:
     return MODELS_DIR
 
 
-def get_model_path(custom_path: Optional[str] = None) -> Path:
-    """Return the path to the saved model weights (.pth file)."""
-    if custom_path:
-        return Path(custom_path)
-    return DEFAULT_MODEL_PATH
+def get_resnet_model_path() -> Path:
+    """Return path to the ResNet weights. Falls back to legacy path."""
+    if RESNET_MODEL_PATH.exists():
+        return RESNET_MODEL_PATH
+    if LEGACY_MODEL_PATH.exists():
+        return LEGACY_MODEL_PATH
+    return RESNET_MODEL_PATH  # will be checked at load time
+
+
+def get_lstm_model_path() -> Path:
+    """Return path to the LSTM weights."""
+    return LSTM_MODEL_PATH
