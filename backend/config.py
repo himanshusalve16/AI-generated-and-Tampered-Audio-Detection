@@ -73,8 +73,8 @@ RESNET_NUM_CLASSES = 2
 # Adjust these to trust one model more than the other.
 # -----------------------------------------------------------------------------
 
-RESNET_WEIGHT = 0.5
-LSTM_WEIGHT = 0.5
+RESNET_WEIGHT = 0.3
+LSTM_WEIGHT = 0.7
 
 # -----------------------------------------------------------------------------
 # Class labels  (index 0 → Real, index 1 → AI Generated)

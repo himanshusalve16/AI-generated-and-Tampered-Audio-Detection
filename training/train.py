@@ -489,7 +489,7 @@ def train(
     # -----------------------------------------------------------------------
     # 6. Generate plots and evaluation
     # -----------------------------------------------------------------------
-    outputs_dir = DEFAULT_OUTPUTS_DIR
+    outputs_dir = DEFAULT_OUTPUTS_DIR / architecture   # outputs/resnet/ or outputs/lstm/
     outputs_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Saving evaluation outputs to: %s", outputs_dir)
 

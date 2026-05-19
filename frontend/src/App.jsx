@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { gsap } from 'gsap';
 import { Waves, Sparkles } from 'lucide-react';
@@ -9,25 +9,35 @@ function App() {
   const [file, setFile] = useState(null);
   const [audioUrl, setAudioUrl] = useState('');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);   // full ensemble result object
+  const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+
+  // --- Mic recording state ---
+  const [recording, setRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const timerRef = useRef(null);
 
   const containerRef = useRef(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
-
     gsap.fromTo(
       containerRef.current,
       { opacity: 0, y: 40, scale: 0.96 },
-      {
-        opacity: 1,
-        y: 0,
-        scale: 1,
-        duration: 0.9,
-        ease: 'power3.out'
-      }
+      { opacity: 1, y: 0, scale: 1, duration: 0.9, ease: 'power3.out' }
     );
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+    };
   }, []);
 
   const handleFileChange = (event) => {
@@ -46,9 +56,73 @@ function App() {
     setAudioUrl(url);
   };
 
+  // --- Mic recording handlers ---
+  const startRecording = useCallback(async () => {
+    setResult(null);
+    setError('');
+    setFile(null);
+    setAudioUrl('');
+    chunksRef.current = [];
+    setRecordingTime(0);
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // Pick a supported MIME type
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : '';
+
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        // Stop all mic tracks
+        stream.getTracks().forEach((t) => t.stop());
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+
+        if (chunksRef.current.length === 0) return;
+
+        const blob = new Blob(chunksRef.current, {
+          type: recorder.mimeType || 'audio/webm',
+        });
+
+        // Determine extension from MIME
+        const ext = blob.type.includes('webm') ? 'webm' : blob.type.includes('ogg') ? 'ogg' : 'wav';
+        const recorded = new File([blob], `mic_recording.${ext}`, { type: blob.type });
+        setFile(recorded);
+        setAudioUrl(URL.createObjectURL(blob));
+        setRecording(false);
+      };
+
+      recorder.start(250); // collect in 250ms chunks
+      setRecording(true);
+
+      // Timer for UI display
+      timerRef.current = setInterval(() => {
+        setRecordingTime((prev) => prev + 1);
+      }, 1000);
+    } catch (err) {
+      console.error('Microphone access error:', err);
+      setError('Could not access microphone. Please allow mic permission and try again.');
+    }
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+  }, []);
+
   const handleUpload = async () => {
     if (!file) {
-      setError('Please select an audio file first.');
+      setError('Please select or record an audio file first.');
       return;
     }
 
@@ -61,12 +135,9 @@ function App() {
       formData.append('file', file);
 
       const response = await axios.post('http://localhost:8000/predict', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data'
-        }
+        headers: { 'Content-Type': 'multipart/form-data' },
       });
 
-      // Store the full ensemble response
       setResult(response.data);
     } catch (err) {
       if (err.response && err.response.data && err.response.data.detail) {
@@ -99,8 +170,8 @@ function App() {
               AI-Generated &amp; Tampered Audio Detection
             </h1>
             <p className="mt-2 text-sm md:text-base text-slate-300 max-w-2xl">
-              Upload a short audio clip to analyze mel-spectrogram features with a
-              ResNet-18 + LSTM ensemble and estimate whether it is real human speech or AI-generated.
+              Upload a file or record from your microphone to analyze mel-spectrogram features with a
+              ResNet-18 + LSTM ensemble and detect AI-generated speech.
             </p>
           </div>
         </header>
@@ -111,8 +182,12 @@ function App() {
             audioUrl={audioUrl}
             loading={loading}
             error={error}
+            recording={recording}
+            recordingTime={recordingTime}
             onFileChange={handleFileChange}
             onUpload={handleUpload}
+            onStartRecording={startRecording}
+            onStopRecording={stopRecording}
           />
 
           <ResultCard result={result} loading={loading} />

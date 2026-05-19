@@ -1,0 +1,15 @@
+=== Classification Report ===
+
+              precision    recall  f1-score   support
+
+        Real       0.96      0.97      0.96       202
+AI Generated       0.94      0.91      0.92        98
+
+    accuracy                           0.95       300
+   macro avg       0.95      0.94      0.94       300
+weighted avg       0.95      0.95      0.95       300
+
+Accuracy : 0.9500
+Precision: 0.9498
+Recall   : 0.9500
+F1-score : 0.9498
